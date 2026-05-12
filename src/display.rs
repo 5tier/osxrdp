@@ -98,6 +98,21 @@ impl RdpServerDisplay for MacDisplay {
     }
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+        // Wait briefly for DisplayControl layout from the client.
+        // Starting at the client's preferred size avoids a DeactivationReactivation
+        // cycle which causes SCKit stream recreation issues.
+        let mut polled: u32 = 0;
+        loop {
+            if self.resize_rx.has_changed().unwrap_or(false) {
+                let _ = self.resize_rx.borrow_and_update();
+            }
+            if self.current_size.is_some() || polled >= 50 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            polled += 1;
+        }
+
         let size = self.size().await;
         debug!(
             "Starting display stream at {}×{} (mode={:?}, target_fps={})",
