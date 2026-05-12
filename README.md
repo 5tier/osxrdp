@@ -95,7 +95,8 @@ On a static desktop this reduces per-frame bandwidth by ~90 %.
 |-------------|---------|
 | macOS | 12.3+ (ScreenCaptureKit) |
 | Rust toolchain | 1.75+ |
-| Xcode Command Line Tools | any recent |
+| Xcode Command Line Tools | any recent (full Xcode not required) |
+| Swift | ships with CLT / Xcode |
 
 ## Dev environment setup
 
@@ -111,6 +112,8 @@ source "$HOME/.cargo/env"
 ```sh
 xcode-select --install
 ```
+
+> Full Xcode is not required — Command Line Tools is sufficient. The `screencapturekit` crate compiles a Swift bridge at build time; `build.rs` ensures the Swift runtime rpath is set correctly for both CLT and full Xcode installs.
 
 ### 3. Clone and build
 
