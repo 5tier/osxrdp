@@ -1,0 +1,43 @@
+[package]
+name = "osxrdp"
+version = "0.1.0"
+edition = "2021"
+description = "RDP server for macOS"
+
+[[bin]]
+name = "osxrdp"
+path = "src/main.rs"
+
+[dependencies]
+# RDP protocol stack
+ironrdp-pdu = "0.7"
+ironrdp-server = "0.10"
+ironrdp-acceptor = "0.8"
+ironrdp-graphics = "0.7"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# TLS
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+rcgen = "0.13"
+tokio-rustls = "0.26"
+
+# Serialization / utility
+byteorder = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
