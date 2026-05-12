@@ -50,39 +50,39 @@ jobs:
           cp "target/release/${APP_NAME}" "$MACOS/${APP_NAME}"
 
           # Generate Info.plist
-          cat > "${CONTENTS}/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleDevelopmentRegion</key>
-  <string>en</string>
-  <key>CFBundleDisplayName</key>
-  <string>${APP_NAME}</string>
-  <key>CFBundleExecutable</key>
-  <string>${APP_NAME}</string>
-  <key>CFBundleIdentifier</key>
-  <string>${BUNDLE_ID}</string>
-  <key>CFBundleInfoDictionaryVersion</key>
-  <string>6.0</string>
-  <key>CFBundleName</key>
-  <string>${APP_NAME}</string>
-  <key>CFBundlePackageType</key>
-  <string>APPL</string>
-  <key>CFBundleShortVersionString</key>
-  <string>${{ steps.info.outputs.version }}</string>
-  <key>CFBundleVersion</key>
-  <string>${{ github.run_number }}</string>
-  <key>LSMinimumSystemVersion</key>
-  <string>12.0</string>
-  <key>NSHighResolutionCapable</key>
-  <true/>
-  <key>NSHumanReadableCopyright</key>
-  <string>MIT License</string>
-</dict>
-</plist>
-PLIST
+          {
+            echo '<?xml version="1.0" encoding="UTF-8"?>'
+            echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"'
+            echo '  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+            echo '<plist version="1.0">'
+            echo '<dict>'
+            echo '  <key>CFBundleDevelopmentRegion</key>'
+            echo '  <string>en</string>'
+            echo '  <key>CFBundleDisplayName</key>'
+            echo "  <string>${APP_NAME}</string>"
+            echo '  <key>CFBundleExecutable</key>'
+            echo "  <string>${APP_NAME}</string>"
+            echo '  <key>CFBundleIdentifier</key>'
+            echo "  <string>${BUNDLE_ID}</string>"
+            echo '  <key>CFBundleInfoDictionaryVersion</key>'
+            echo '  <string>6.0</string>'
+            echo '  <key>CFBundleName</key>'
+            echo "  <string>${APP_NAME}</string>"
+            echo '  <key>CFBundlePackageType</key>'
+            echo '  <string>APPL</string>'
+            echo '  <key>CFBundleShortVersionString</key>'
+            echo "  <string>${{ steps.info.outputs.version }}</string>"
+            echo '  <key>CFBundleVersion</key>'
+            echo "  <string>${{ github.run_number }}</string>"
+            echo '  <key>LSMinimumSystemVersion</key>'
+            echo '  <string>12.0</string>'
+            echo '  <key>NSHighResolutionCapable</key>'
+            echo '  <true/>'
+            echo '  <key>NSHumanReadableCopyright</key>'
+            echo '  <string>MIT License</string>'
+            echo '</dict>'
+            echo '</plist>'
+          } > "${CONTENTS}/Info.plist"
 
           # Ad-hoc sign the bundle (required for hardened runtime on modern macOS)
           codesign --force --deep --sign - "${BUNDLE}"
