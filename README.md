@@ -23,7 +23,7 @@ ScreenCaptureKit   CGEventPost
 
 ## Status
 
-Phase 1 & partial Phase 2 implemented. The full pipeline compiles and runs; real end-to-end testing requires granting the two macOS permissions below.
+Phase 1 & Phase 2 (T9–T11) implemented. End-to-end tested with FreeRDP; real screen capture requires granting the Screen Recording macOS permission.
 
 | # | Feature | Done |
 |---|---------|------|
@@ -31,9 +31,9 @@ Phase 1 & partial Phase 2 implemented. The full pipeline compiles and runs; real
 | T4–T5 | Screen capture via ScreenCaptureKit | ✅ |
 | T6–T8 | Keyboard + mouse injection via CGEventPost | ✅ |
 | T9 | Dirty-region diffing (only send changed tiles) | ✅ |
-| T10 | Display resize handling | ⬜ |
-| T11 | Permission UX at startup | ⬜ |
-| T12 | CLI flags (`--addr`, `--cert`, `--key`, …) | ⬜ |
+| T10 | Display resize handling | ✅ |
+| T11 | Permission UX at startup | ✅ |
+| T12 | CLI flags (`--addr`, `--cert`, `--key`, …) | 🔶 env vars only |
 | T13 | Graceful SIGTERM / SIGINT shutdown | ⬜ |
 | T14 | H.264 via VideoToolbox | ⬜ |
 | T17 | Clipboard redirection | ⬜ |
@@ -136,15 +136,9 @@ System Settings → Privacy & Security → Screen Recording → osxrdp ✓
 
 Or trigger the dialog by running the binary once — macOS will prompt automatically on the first `SCShareableContent` call.
 
-**Accessibility**
+**Accessibility / Input Injection**
 
-```
-System Settings → Privacy & Security → Accessibility → osxrdp ✓
-```
-
-Required for `CGEventPost` to inject keyboard and mouse events.
-
-> **Tip — during development:** run from a terminal that already has Accessibility access (e.g. Terminal.app or iTerm2 already listed). The child process inherits the permission.
+`CGEventPost` (keyboard + mouse injection) works without a separate permission on recent macOS versions. If input is not responding, try running osxrdp from a terminal that is already listed under Privacy & Security → Accessibility (Terminal.app, iTerm2, etc.).
 
 ## Running
 
@@ -158,14 +152,24 @@ cargo run --release
 # The server listens on all interfaces, port 3389.
 ```
 
+### Credentials
+
+RDP clients must authenticate. The default credentials are **`admin` / `admin`**. Override with environment variables:
+
+```sh
+OSXRDP_USER=alice OSXRDP_PASSWORD=secret cargo run
+```
+
+> **Windows / NLA:** Windows `mstsc` defaults to requiring NLA (CredSSP). Until T19 is implemented, connect with FreeRDP (`/cert:ignore`) or configure mstsc to allow TLS-only: Options → Advanced → uncheck "Always ask for credentials" and set Authentication to "No Authentication".
+
 Connect from any RDP client, for example:
 
 | Client | Command / setting |
 |--------|------------------|
-| **macOS** Microsoft Remote Desktop | Add PC → `<mac-ip>` |
-| **Windows** built-in mstsc | `mstsc /v:<mac-ip>` |
-| **Linux** FreeRDP | `xfreerdp /v:<mac-ip> /cert:ignore` |
-| **iOS / Android** RD Client | Add PC → `<mac-ip>` |
+| **macOS** Microsoft Remote Desktop | Add PC → `<mac-ip>`, Username: `admin`, Password: `admin` |
+| **Windows** built-in mstsc | `mstsc /v:<mac-ip>` (disable NLA — see note above) |
+| **Linux** FreeRDP | `xfreerdp /v:<mac-ip> /cert:ignore /u:admin /p:admin` |
+| **iOS / Android** RD Client | Add PC → `<mac-ip>`, Username: `admin`, Password: `admin` |
 
 > **TLS certificate:** osxrdp generates a self-signed cert on every start. Clients will show an untrusted-certificate warning — accept it. For a persistent cert, replace `tls::build_acceptor()` with one that loads a cert from disk (T12 will add `--cert`/`--key` flags).
 

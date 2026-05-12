@@ -11,6 +11,8 @@ path = "src/main.rs"
 [dependencies]
 # RDP protocol — handles negotiation, encoding, session loop
 ironrdp-server = "0.10"
+# DisplayControl virtual channel PDUs (MonitorLayoutEntry, resize)
+ironrdp-displaycontrol = "0.5"
 # Diff algorithm for dirty-region detection (find_different_rects_sub)
 ironrdp-graphics = "0.7"
 
@@ -45,3 +47,7 @@ thiserror = "2"
 [profile.release]
 opt-level = 3
 lto = true
+
+[patch.crates-io]
+# Domain-agnostic credential comparison (clients send arbitrary domain values)
+ironrdp-acceptor = { path = "vendor/ironrdp-acceptor" }

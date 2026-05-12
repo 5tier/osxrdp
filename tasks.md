@@ -14,9 +14,9 @@
 ## Phase 2: Correctness & Usability
 
 - [x] **T9**  Dirty-region diffing: only send changed tiles (`find_different_rects_sub` + `BitmapUpdate::sub`)
-- [ ] **T10** Display resize: handle `DisplayUpdate::Resize` from `request_layout`
-- [ ] **T11** Permission UX: check Screen Recording + Accessibility at startup, print actionable instructions if missing
-- [ ] **T12** CLI flags: `--addr`, `--cert`, `--key`, `--width`, `--height` via `clap`
+- [x] **T10** Display resize: handle `DisplayUpdate::Resize` from `request_layout`
+- [x] **T11** Permission UX: check Screen Recording + Accessibility at startup, print actionable instructions if missing
+- [~] **T12** CLI flags: `--addr`, `--cert`, `--key`, `--width`, `--height` via `clap` (env vars `OSXRDP_ADDR`, `OSXRDP_USER`, `OSXRDP_PASSWORD` working; clap flags TBD)
 - [ ] **T13** Graceful shutdown: catch SIGTERM/SIGINT, call `RdpServer` quit event
 
 ## Phase 3: Performance

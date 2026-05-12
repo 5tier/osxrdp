@@ -1432,8 +1432,6 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 [[package]]
 name = "ironrdp-acceptor"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52c18abf50681dda6ea22ac3a812a385ee915a4a69512c775c2358541e89fdd2"
 dependencies = [
  "ironrdp-async",
  "ironrdp-connector",
@@ -1957,6 +1955,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "core-graphics",
+ "ironrdp-displaycontrol",
  "ironrdp-graphics",
  "ironrdp-server",
  "rcgen",
