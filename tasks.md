@@ -21,8 +21,8 @@
 
 ## Phase 3: Performance
 
-- [ ] **T14** H.264 encoding via `VideoToolbox` (YCbCr 420 path through screencapturekit)
-- [ ] **T15** Frame rate cap: honour SCKit `minimum_frame_interval` to target 30 fps
+- [x] **T14** H.264 encoding via `VideoToolbox` (YCbCr 420 path through screencapturekit)
+- [x] **T15** Frame rate cap: honour SCKit `minimum_frame_interval` to target 30 fps
 - [ ] **T16** Multi-monitor: enumerate all displays, let client choose via CLI flag
 
 ## Phase 4: Features

@@ -27,6 +27,9 @@ tokio-rustls = "0.26"
 # Screen capture (macOS 12.3+)
 screencapturekit = { version = "2", features = ["async"] }
 
+# libc for signal handlers
+libc = "0.2"
+
 # Input injection — CGEventPost
 core-graphics = { version = "0.25", features = ["highsierra"] }
 
@@ -47,7 +50,12 @@ thiserror = "2"
 [profile.release]
 opt-level = 3
 lto = true
+codegen-units = 1
 
 [patch.crates-io]
 # Domain-agnostic credential comparison (clients send arbitrary domain values)
 ironrdp-acceptor = { path = "vendor/ironrdp-acceptor" }
+# H.264 AVC420 encoding via RDPGFX pipeline
+ironrdp-server = { path = "vendor/ironrdp-server" }
+# GFX capability version handling - gracefully handle unknown client versions
+ironrdp-pdu = { path = "vendor/ironrdp-pdu-0.7.0" }

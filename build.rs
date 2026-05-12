@@ -25,6 +25,14 @@ fn main() {
     // under /usr/lib/swift.
     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
 
+    // Link macOS VideoToolbox framework for H.264 hardware encoding (T14).
+    println!("cargo:rustc-link-lib=framework=VideoToolbox");
+    // Link CoreMedia and CoreVideo for CMSampleBuffer / CVPixelBuffer access.
+    println!("cargo:rustc-link-lib=framework=CoreMedia");
+    println!("cargo:rustc-link-lib=framework=CoreVideo");
+    // Link CoreFoundation for CFString / CFNumber / CFBoolean APIs.
+    println!("cargo:rustc-link-lib=framework=CoreFoundation");
+
     // Pre-macOS-12 fallback: the library shipped inside the Xcode toolchain.
     // Only add these paths on a full Xcode install (not CLT) to avoid
     // loading a second copy alongside the dyld cache version.

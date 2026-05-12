@@ -8,7 +8,7 @@ Windows / Linux / Android RDP client
             ▼
       ┌─────────────┐
       │   osxrdp    │
-      │  (this app) │
+      │  (this app)  │
       └──────┬──────┘
              │
     ┌────────┴────────┐
@@ -23,7 +23,7 @@ ScreenCaptureKit   CGEventPost
 
 ## Status
 
-Phase 1 & Phase 2 (T9–T11) implemented. End-to-end tested with FreeRDP; real screen capture requires granting the Screen Recording macOS permission.
+Phase 1–3 (T1–T11, T14–T15) implemented. End-to-end tested with FreeRDP; real screen capture requires granting the Screen Recording macOS permission.
 
 | # | Feature | Done |
 |---|---------|------|
@@ -35,36 +35,64 @@ Phase 1 & Phase 2 (T9–T11) implemented. End-to-end tested with FreeRDP; real s
 | T11 | Permission UX at startup | ✅ |
 | T12 | CLI flags (`--addr`, `--cert`, `--key`, …) | 🔶 env vars only |
 | T13 | Graceful SIGTERM / SIGINT shutdown | ⬜ |
-| T14 | H.264 via VideoToolbox | ⬜ |
+| T14 | H.264 via VideoToolbox | ✅ |
+| T15 | Frame rate cap via SCKit `minimum_frame_interval` | ✅ |
+| T16 | Multi-monitor support | ⬜ |
 | T17 | Clipboard redirection | ⬜ |
+| T18 | Audio redirection | ⬜ |
 | T19 | NLA / CredSSP authentication | ⬜ |
+| T20 | launchd plist (background agent) | ⬜ |
 
 ## Architecture
 
 ```
 src/
-├── main.rs        RdpServerBuilder wiring — TLS + display + input
+├── main.rs        RdpServerBuilder wiring — TLS + display + input + H.264 mode
 ├── tls.rs         Self-signed TLS cert (rcgen + rustls 0.23)
 ├── display.rs     MacDisplay / MacDisplayUpdates
-│                    AsyncSCStream → BitmapUpdate pipeline
+│                    AsyncSCStream → BitmapUpdate  (BGRA fallback)
+│                    AsyncSCStream → VtH264Encoder → Avc420Update  (H.264 mode)
 │                    Dirty-region diffing via ironrdp-graphics
+├── h264.rs        VideoToolbox H.264 encoder (raw macOS FFI)
+│                    CVPixelBuffer (NV12) → AVCC-format H.264 NAL units
 ├── input.rs       MacInputHandler
 │                    KeyboardEvent → CGEventPost
 │                    MouseEvent → CGEventPost
 └── keyboard.rs    Windows scancode set-1 → macOS CGKeyCode table
 ```
 
+### Vendored libraries
+
+The `vendor/` directory contains locally patched copies of upstream `ironrdp` crates. These are used instead of the crates.io versions via `[patch.crates-io]` in `Cargo.toml`.
+
+| Crate | Upstream | Why vendored? |
+|-------|-----------|---------------|
+| `ironrdp-acceptor` | `ironrdp-acceptor 0.8` | Domain-agnostic credential comparison (RDP clients send arbitrary domain values; the upstream version rejects anything that isn't an exact match) |
+| `ironrdp-server` | `ironrdp-server 0.10` | H.264 AVC420 support: adds `DisplayUpdate::Avc420` variant, `Avc420Update` type, `GfxServer` / `SharedGfxServer` RDPGFX DVC channel processor, and `RdpServer::set_gfx_server` wiring |
+
+When upgrading these crates, re-apply the local patches or merge upstream changes into the vendored copies. Key files modified in `vendor/ironrdp-server/src/`:
+
+```
+display.rs    — Avc420Update struct, DisplayUpdate::Avc420 variant
+encoder/mod.rs — skip Avc420 in surface-command encoder
+gfx.rs        — new file: RDPGFX DVC channel (capabilities, surface, WireToSurface1/AVC420)
+lib.rs        — pub mod gfx, pub use gfx::*
+server.rs     — gfx_server field, set_gfx_server(), attach_channels, client_loop Avc420 routing
+```
+
 ### Protocol stack
 
 `ironrdp-server` handles the entire RDP wire protocol — X.224 negotiation, MCS, capability exchange, fast-path input/output, and bitmap encoding. `osxrdp` only needs to implement two traits:
 
-- **`RdpServerDisplay`** — supply screen frames  
+- **`RdpServerDisplay`** — supply screen frames
 - **`RdpServerInputHandler`** — consume keyboard/mouse events
 
-### Screen capture pipeline
+For H.264 mode, frames also flow through the **RDPGFX** dynamic virtual channel (`Microsoft::Windows::RDS::Graphics`), which sends `WireToSurface1(AVC420)` PDUs carrying VideoToolbox-encoded H.264 NAL units.
+
+### Screen capture pipeline — BGRA mode (default before T14)
 
 ```
-AsyncSCStream (SCKit)
+AsyncSCStream (SCKit, BGRA)
     │  CMSampleBuffer @ ≤30 fps
     ▼
 CVPixelBuffer lock → &[u8] (kCVPixelFormatType_32BGRA)
@@ -84,6 +112,26 @@ CVPixelBuffer lock → &[u8] (kCVPixelFormatType_32BGRA)
 ```
 
 On a static desktop this reduces per-frame bandwidth by ~90 %.
+
+### Screen capture pipeline — H.264 mode (T14)
+
+```
+AsyncSCStream (SCKit, YCbCr_420v / NV12)
+    │  CMSampleBuffer @ target 30 fps
+    ▼
+CVPixelBuffer → VtH264Encoder  (VideoToolbox hardware encode)
+    │  AVCC-format H.264 NAL units
+    ▼
+Avc420Update { data, width, height, is_keyframe }
+    │
+    ▼
+GfxServer (RDPGFX DVC channel)
+    │  StartFrame → WireToSurface1(AVC420) → EndFrame
+    ▼
+DrdynvcServer → RDP client
+```
+
+H.264 mode is enabled by default (OSXRDP_H264=1). It provides order-of-magnitude bandwidth reduction vs. raw BGRA bitmaps.
 
 ### Input injection
 
@@ -149,8 +197,20 @@ RUST_LOG=osxrdp=debug cargo run
 # Release build, quiet
 cargo run --release
 
+# Disable H.264 (fall back to BGRA bitmap mode)
+OSXRDP_H264=0 cargo run
+
 # The server listens on all interfaces, port 3389.
 ```
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OSXRDP_ADDR` | `0.0.0.0:3389` | Listen address and port |
+| `OSXRDP_USER` | `admin` | RDP username |
+| `OSXRDP_PASSWORD` | `admin` | RDP password |
+| `OSXRDP_H264` | `1` | Enable H.264 VideoToolbox encoding (`0` = BGRA fallback) |
 
 ### Credentials
 
@@ -189,10 +249,9 @@ RUST_LOG=off          cargo run   # silent
 
 See [`tasks.md`](tasks.md) for the full task list. Highest-value next items:
 
-1. **T11** — permission check UX (startup guidance if perms missing)  
-2. **T12** — CLI flags (`clap`) for addr, cert, key, resolution  
-3. **T14** — H.264 via VideoToolbox (order-of-magnitude bandwidth reduction)  
-4. **T19** — NLA/CredSSP so Windows clients work with default settings  
+1. **T13** — graceful SIGTERM / SIGINT shutdown
+2. **T16** — multi-monitor support
+3. **T19** — NLA/CredSSP so Windows clients work with default settings
 
 ## License
 
