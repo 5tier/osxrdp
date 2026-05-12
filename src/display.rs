@@ -260,18 +260,22 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 
             let Some(pixel_buf) = sample.image_buffer() else {
                 self.missed_frames += 1;
-                // SCKit sometimes enters a dead state delivering null buffers.
-                // Recreate the stream after 5 consecutive misses (~160ms at 30fps).
-                if self.missed_frames >= 5 {
+                // SCKit sometimes delivers null buffers temporarily. Instead of
+                // recreating the stream (which burns through limited SCKit resources
+                // and makes things worse), just wait — the stream usually recovers
+                // after a brief pause.
+                if self.missed_frames == 1 {
+                    debug!("SCKit null buffer (frame {})", self.missed_frames);
+                }
+                if self.missed_frames >= 30 {
+                    // After ~1s of continuous nulls, try a full stream reset
                     warn!("SCKit stream stalled ({} missed frames), recreating", self.missed_frames);
-                    match create_stream(self.stream_size.width, self.stream_size.height, self.mode, self.target_fps).await {
-                        Ok(new_stream) => {
-                            self.stream = new_stream;
-                            self.missed_frames = 0;
-                            // Keep previous frame data for dirty-rect diffing
-                            // instead of forcing a full refresh.
-                        }
-                        Err(e) => warn!("Failed to recreate SCKit stream: {e}"),
+                    if let Ok(new_stream) = create_stream(
+                        self.stream_size.width, self.stream_size.height,
+                        self.mode, self.target_fps,
+                    ).await {
+                        self.stream = new_stream;
+                        self.missed_frames = 0;
                     }
                 }
                 continue;
