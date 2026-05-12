@@ -1,4 +1,5 @@
 use core::mem;
+use std::sync::Arc;
 
 use ironrdp_connector::{
     encode_x224_packet, general_err, reason_err, ConnectorError, ConnectorErrorExt as _, ConnectorResult, DesktopSize,
@@ -34,6 +35,10 @@ pub struct Acceptor {
     static_channels: StaticChannelSet,
     saved_for_reactivation: AcceptorState,
     pub(crate) creds: Option<Credentials>,
+    /// Optional callback that validates a (username, password) pair against
+    /// an external authority (e.g. macOS Directory Services).  When set the
+    /// simple string comparison against `creds` is bypassed.
+    pub(crate) authenticate: Option<Arc<dyn Fn(&str, &str) -> bool + Send + Sync>>,
     reactivation: bool,
 }
 
@@ -64,8 +69,13 @@ impl Acceptor {
             static_channels: StaticChannelSet::new(),
             saved_for_reactivation: Default::default(),
             creds,
+            authenticate: None,
             reactivation: false,
         }
+    }
+
+    pub fn set_authenticator(&mut self, f: Arc<dyn Fn(&str, &str) -> bool + Send + Sync>) {
+        self.authenticate = Some(f);
     }
 
     pub fn new_deactivation_reactivation(
@@ -105,6 +115,7 @@ impl Acceptor {
             static_channels,
             saved_for_reactivation,
             creds: consumed.creds,
+            authenticate: consumed.authenticate,
             reactivation: true,
         })
     }
@@ -530,12 +541,19 @@ impl Sequence for Acceptor {
                 if !protocol.intersects(SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
                     let creds = client_info.client_info.credentials;
 
-                    // Match username + password only; ignore the domain field because
-                    // clients send wildly different values (empty, machine name, "WORKGROUP")
-                    // and osxrdp does not enforce domain-based auth.
-                    let auth_ok = self.creds.as_ref().map_or(false, |expected| {
-                        expected.username == creds.username && expected.password == creds.password
-                    });
+                    let auth_ok = if let Some(ref authenticator) = self.authenticate {
+                        // System-level authentication (e.g. macOS OpenDirectory).
+                        // Domain field is irrelevant — we check against the OS user database.
+                        authenticator(&creds.username, &creds.password)
+                    } else {
+                        // Fallback: match username + password against configured credentials.
+                        // Ignore the domain field because clients send wildly different
+                        // values (empty, machine name, "WORKGROUP").
+                        self.creds.as_ref().map_or(false, |expected| {
+                            expected.username == creds.username
+                                && expected.password == creds.password
+                        })
+                    };
 
                     if !auth_ok {
                         // FIXME: How authorization should be denied with standard RDP security?

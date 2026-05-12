@@ -30,6 +30,8 @@ screencapturekit = { version = "2", features = ["async"] }
 # libc for signal handlers
 libc = "0.2"
 
+
+
 # Input injection — CGEventPost
 core-graphics = { version = "0.25", features = ["highsierra"] }
 

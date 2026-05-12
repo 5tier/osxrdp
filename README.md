@@ -1,5 +1,7 @@
 # osxrdp
 
+[![Build and Package](https://github.com/ruwen/osxrdp/actions/workflows/rust.yml/badge.svg)](https://github.com/ruwen/osxrdp/actions/workflows/rust.yml)
+
 An RDP server for macOS — lets any Windows / Linux / Android RDP client connect to and control a Mac desktop over Microsoft's Remote Desktop Protocol (TCP 3389).
 
 ```
@@ -10,16 +12,31 @@ Windows / Linux / Android RDP client
       │   osxrdp    │
       │  (this app)  │
       └──────┬──────┘
-             │
+            │
     ┌────────┴────────┐
     │                 │
 ScreenCaptureKit   CGEventPost
   (screen pixels)  (keyboard + mouse)
     │                 │
     └────────┬────────┘
-             │
-       macOS Desktop
+            │
+      macOS Desktop
 ```
+
+## Downloads
+
+Pre-built packages are available on the [Releases page](https://github.com/ruwen/osxrdp/releases). Each release contains a macOS `.app` bundle compressed as a `.tar.gz` archive:
+
+```
+osxrdp-<version>-macos-arm64.tar.gz
+  └── osxrdp.app/
+        └── Contents/
+              ├── Info.plist
+              └── MacOS/
+                    └── osxrdp          # release binary
+```
+
+Every push to `main` also produces a build artifact on the [Actions page](https://github.com/ruwen/osxrdp/actions) with the same layout — useful for testing the latest unreleased changes.
 
 ## Status
 
@@ -48,6 +65,7 @@ Phase 1–3 (T1–T11, T14–T15) implemented. End-to-end tested with FreeRDP; r
 ```
 src/
 ├── main.rs        RdpServerBuilder wiring — TLS + display + input + H.264 mode
+├── auth.rs        macOS system account authentication via dscl / opendirectoryd
 ├── tls.rs         Self-signed TLS cert (rcgen + rustls 0.23)
 ├── display.rs     MacDisplay / MacDisplayUpdates
 │                    AsyncSCStream → BitmapUpdate  (BGRA fallback)
@@ -172,7 +190,43 @@ cargo build          # debug build
 cargo build --release  # optimised build
 ```
 
-### 4. Grant macOS permissions
+### 4. Package (optional)
+
+The CI pipeline (see `.github/workflows/rust.yml`) creates a macOS `.app` bundle automatically on every push. To produce one locally:
+
+```sh
+cargo build --release
+mkdir -p osxrdp.app/Contents/MacOS
+cp target/release/osxrdp osxrdp.app/Contents/MacOS/
+# generate Contents/Info.plist (template below)
+codesign --force --deep --sign - osxrdp.app
+```
+
+<details>
+<summary>Minimal <code>Info.plist</code> template</summary>
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key>
+  <string>osxrdp</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.github.osxrdp</string>
+  <key>CFBundleName</key>
+  <string>osxrdp</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>12.0</string>
+</dict>
+</plist>
+```
+</details>
+
+### 5. Grant macOS permissions
 
 osxrdp needs two permissions. Grant them **before** running, or the server will start but deliver blank frames / ignored input.
 
@@ -203,37 +257,34 @@ OSXRDP_H264=0 cargo run
 # The server listens on all interfaces, port 3389.
 ```
 
+From the packaged `.app` bundle:
+
+```sh
+osxrdp.app/Contents/MacOS/osxrdp
+# or double-click the app (it will open a terminal window with the server log)
+```
+
 ### Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OSXRDP_ADDR` | `0.0.0.0:3389` | Listen address and port |
-| `OSXRDP_USER` | `admin` | RDP username |
-| `OSXRDP_PASSWORD` | `admin` | RDP password |
 | `OSXRDP_H264` | `1` | Enable H.264 VideoToolbox encoding (`0` = BGRA fallback) |
 
-### Credentials
+### Connecting
 
-RDP clients must authenticate. The default credentials are **`admin` / `admin`**. Override with environment variables:
-
-```sh
-OSXRDP_USER=alice OSXRDP_PASSWORD=secret cargo run
-```
-
-> **Windows / NLA:** Windows `mstsc` defaults to requiring NLA (CredSSP). Until T19 is implemented, connect with FreeRDP (`/cert:ignore`) or configure mstsc to allow TLS-only: Options → Advanced → uncheck "Always ask for credentials" and set Authentication to "No Authentication".
-
-Connect from any RDP client, for example:
+Connect from any RDP client. Authenticate with any **macOS system user account** — credentials are validated against the local directory service via `opendirectoryd` (the same backend used by the login window and SSH).
 
 | Client | Command / setting |
 |--------|------------------|
-| **macOS** Microsoft Remote Desktop | Add PC → `<mac-ip>`, Username: `admin`, Password: `admin` |
-| **Windows** built-in mstsc | `mstsc /v:<mac-ip>` (disable NLA — see note above) |
-| **Linux** FreeRDP | `xfreerdp /v:<mac-ip> /cert:ignore /u:admin /p:admin` |
-| **iOS / Android** RD Client | Add PC → `<mac-ip>`, Username: `admin`, Password: `admin` |
+| **macOS** Microsoft Remote Desktop | Add PC → `<mac-ip>`, Username: `<mac-user>`, Password: `<mac-password>` |
+| **Windows** built-in mstsc | `mstsc /v:<mac-ip>` (disable NLA — see note below) |
+| **Linux** FreeRDP | `xfreerdp /v:<mac-ip> /cert:ignore /u:<mac-user> /p:<mac-password>` |
+| **iOS / Android** RD Client | Add PC → `<mac-ip>`, Username: `<mac-user>`, Password: `<mac-password>` |
 
+> **NLA not yet implemented (T19):** Windows `mstsc` defaults to requiring NLA (CredSSP). Until T19 is implemented, connect with FreeRDP (`/cert:ignore`) or configure mstsc to allow TLS-only: Options → Advanced → uncheck "Always ask for credentials" and set Authentication to "No Authentication".
+>
 > **TLS certificate:** osxrdp generates a self-signed cert on every start. Clients will show an untrusted-certificate warning — accept it. For a persistent cert, replace `tls::build_acceptor()` with one that loads a cert from disk (T12 will add `--cert`/`--key` flags).
-
-> **NLA not yet implemented (T19):** if your Windows client forces NLA, disable it: `mstsc` → Options → Advanced → "Connect and don't warn me" or connect to an older-security RDP endpoint. Alternatively, on the client run `mstsc /v:<ip> /admin`.
 
 ## Logging
 
@@ -251,7 +302,8 @@ See [`tasks.md`](tasks.md) for the full task list. Highest-value next items:
 
 1. **T13** — graceful SIGTERM / SIGINT shutdown
 2. **T16** — multi-monitor support
-3. **T19** — NLA/CredSSP so Windows clients work with default settings
+3. **T19** — NLA/CredSSP (`RdpServerSecurity::Hybrid` + `sspi-rs`) so Windows clients work with default settings
+4. **T20** — `launchd` plist to run osxrdp as a background agent on login
 
 ## License
 

@@ -1,3 +1,4 @@
+mod auth;
 mod display;
 mod h264;
 mod input;
@@ -5,9 +6,11 @@ mod keyboard;
 mod permissions;
 mod tls;
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use display::CaptureMode;
-use ironrdp_server::{Credentials, GfxServer, RdpServer, RdpServerDisplay};
+use ironrdp_server::{GfxServer, RdpServer, RdpServerDisplay};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -70,14 +73,12 @@ async fn main() -> Result<()> {
     permissions::check_and_warn().await;
 
     let addr = std::env::var("OSXRDP_ADDR").unwrap_or_else(|_| "0.0.0.0:3389".to_string());
-    let username = std::env::var("OSXRDP_USER").unwrap_or_else(|_| "admin".to_string());
-    let password = std::env::var("OSXRDP_PASSWORD").unwrap_or_else(|_| "admin".to_string());
     let h264 = std::env::var("OSXRDP_H264").unwrap_or_else(|_| "1".to_string()) == "1";
 
     let mode = if h264 { CaptureMode::H264 } else { CaptureMode::Bgra };
 
-    info!(%addr, %username, ?mode, "Starting osxrdp");
-    info!("Connect with username={username}  password=<OSXRDP_PASSWORD env, default: admin>");
+    info!(%addr, ?mode, "Starting osxrdp");
+    info!("Authentication: macOS system accounts via OpenDirectory");
 
     let tls_acceptor = tls::build_acceptor()?;
 
@@ -98,10 +99,10 @@ async fn main() -> Result<()> {
         info!("RDPGFX H.264 pipeline enabled (OSXRDP_H264=0 to disable)");
     }
 
-    server.set_credentials(Some(Credentials {
-        username,
-        password,
-        domain: None,
+    // Authenticate against macOS system accounts via opendirectoryd.
+    // The authenticator is shared across all incoming connections.
+    server.set_authenticator(Arc::new(|username, password| {
+        auth::verify_user_password(username, password)
     }));
 
     server.run().await

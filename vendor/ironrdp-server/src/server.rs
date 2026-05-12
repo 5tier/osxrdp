@@ -221,6 +221,7 @@ pub struct RdpServer {
     ev_sender: mpsc::UnboundedSender<ServerEvent>,
     ev_receiver: Arc<Mutex<mpsc::UnboundedReceiver<ServerEvent>>>,
     creds: Option<Credentials>,
+    authenticate: Option<Arc<dyn Fn(&str, &str) -> bool + Send + Sync>>,
     local_addr: Option<SocketAddr>,
 }
 
@@ -276,6 +277,7 @@ impl RdpServer {
             ev_sender,
             ev_receiver: Arc::new(Mutex::new(ev_receiver)),
             creds: None,
+            authenticate: None,
             local_addr: None,
         }
     }
@@ -331,6 +333,10 @@ impl RdpServer {
         let mut acceptor = Acceptor::new(self.opts.security.flag(), size, capabilities, self.creds.clone());
 
         self.attach_channels(&mut acceptor);
+
+        if let Some(ref authenticator) = self.authenticate {
+            acceptor.set_authenticator(authenticator.clone());
+        }
 
         let res = ironrdp_acceptor::accept_begin(framed, &mut acceptor)
             .await
@@ -1042,6 +1048,15 @@ impl RdpServer {
     pub fn set_credentials(&mut self, creds: Option<Credentials>) {
         debug!(?creds, "Changing credentials");
         self.creds = creds
+    }
+
+    /// Install a system-authentication callback.
+    ///
+    /// When set the callback will be invoked with the username and password
+    /// sent by the RDP client.  Return `true` to accept the connection,
+    /// `false` to reject it.
+    pub fn set_authenticator(&mut self, f: Arc<dyn Fn(&str, &str) -> bool + Send + Sync>) {
+        self.authenticate = Some(f);
     }
 }
 
