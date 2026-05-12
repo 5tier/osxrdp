@@ -13,7 +13,7 @@
 
 ## Phase 2: Correctness & Usability
 
-- [ ] **T9**  Dirty-region diffing: only send changed tiles (use `Framebuffer::update_diffs`)
+- [x] **T9**  Dirty-region diffing: only send changed tiles (`find_different_rects_sub` + `BitmapUpdate::sub`)
 - [ ] **T10** Display resize: handle `DisplayUpdate::Resize` from `request_layout`
 - [ ] **T11** Permission UX: check Screen Recording + Accessibility at startup, print actionable instructions if missing
 - [ ] **T12** CLI flags: `--addr`, `--cert`, `--key`, `--width`, `--height` via `clap`

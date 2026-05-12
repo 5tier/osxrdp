@@ -11,6 +11,8 @@ path = "src/main.rs"
 [dependencies]
 # RDP protocol — handles negotiation, encoding, session loop
 ironrdp-server = "0.10"
+# Diff algorithm for dirty-region detection (find_different_rects_sub)
+ironrdp-graphics = "0.7"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

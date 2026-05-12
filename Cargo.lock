@@ -1957,6 +1957,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "core-graphics",
+ "ironrdp-graphics",
  "ironrdp-server",
  "rcgen",
  "rustls",
