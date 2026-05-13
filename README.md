@@ -1,6 +1,6 @@
 # osxrdp
 
-[![Build and Package](https://github.com/ruwen/osxrdp/actions/workflows/rust.yml/badge.svg)](https://github.com/ruwen/osxrdp/actions/workflows/rust.yml)
+[![Build and Package](https://github.com/5tier/osxrdp/actions/workflows/rust.yml/badge.svg)](https://github.com/5tier/osxrdp/actions/workflows/rust.yml)
 
 An RDP server for macOS — lets any Windows / Linux / Android RDP client connect to and control a Mac desktop over Microsoft's Remote Desktop Protocol (TCP 3389).
 
@@ -25,7 +25,7 @@ ScreenCaptureKit   CGEventPost
 
 ## Downloads
 
-Pre-built packages are available on the [Releases page](https://github.com/ruwen/osxrdp/releases). Each release contains a macOS `.app` bundle compressed as a `.tar.gz` archive:
+Pre-built packages are available on the [Releases page](https://github.com/5tier/osxrdp/releases). Each release contains a macOS `.app` bundle compressed as a `.tar.gz` archive:
 
 ```
 osxrdp-<version>-macos-arm64.tar.gz
@@ -36,7 +36,7 @@ osxrdp-<version>-macos-arm64.tar.gz
                     └── osxrdp          # release binary
 ```
 
-Every push to `main` also produces a build artifact on the [Actions page](https://github.com/ruwen/osxrdp/actions) with the same layout — useful for testing the latest unreleased changes.
+Every push to `main` also produces a build artifact on the [Actions page](https://github.com/5tier/osxrdp/actions) with the same layout — useful for testing the latest unreleased changes.
 
 ## Status
 
