@@ -128,33 +128,17 @@ impl RdpServerDisplay for MacDisplay {
     fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
         if let Some(monitor) = layout.monitors().first() {
             let (w, h) = monitor.dimensions();
-            
-            // Adjust to 16:10 aspect ratio
-            // This ensures the display matches common monitor ratios
-            let target_ratio = 16.0 / 10.0; // 1.6
-            
-            // Calculate 16:10 resolution that fits within client window
-            // Option 1: Fit by width
-            let new_w1 = w;
-            let new_h1 = (w as f64 / target_ratio) as u32;
-            
-            // Option 2: Fit by height
-            let new_h2 = h;
-            let new_w2 = (h as f64 * target_ratio) as u32;
-            
-            // Choose the option that fits within (w, h)
-            let (new_w, new_h) = if new_h1 <= h {
-                (new_w1, new_h1)
-            } else {
-                (new_w2, new_h2)
-            };
-            
+
+            // Clamp to u16::MAX and use the client-requested dimensions as-is.
+            // The RDP client knows its own window size; ScreenCaptureKit will
+            // scale the physical display to match.  No aspect-ratio adjustment
+            // is needed — the server's display may differ from the client's.
             let size = DesktopSize {
-                width:  new_w.min(u16::MAX as u32) as u16,
-                height: new_h.min(u16::MAX as u32) as u16,
+                width:  (w as u16).min(u16::MAX),
+                height: (h as u16).min(u16::MAX),
             };
             debug!(
-                "request_layout: client wants {}×{}, adjusted to 16:10 {}×{}",
+                "request_layout: client wants {}×{}, using {}×{} (no ratio adjustment)",
                 w, h, size.width, size.height
             );
             if self.current_size == Some(size) {
