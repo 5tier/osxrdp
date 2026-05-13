@@ -64,7 +64,7 @@ extern "C" fn crash_handler(
 async fn main() -> Result<()> {
     fmt()
         .with_env_filter(
-            EnvFilter::from_default_env().add_directive("osxrdp=debug".parse()?),
+            EnvFilter::from_default_env().add_directive("osxrdp=info".parse()?),
         )
         .init();
 
