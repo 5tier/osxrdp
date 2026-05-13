@@ -115,8 +115,8 @@ impl RdpServerDisplay for MacDisplay {
 
         let size = self.size().await;
         debug!(
-            "Starting display stream at {}×{} (mode={:?}, target_fps={})",
-            size.width, size.height, self.mode, self.target_fps
+            "Starting display stream at {}×{} (mode={:?}, target_fps={}, current_size={:?})",
+            size.width, size.height, self.mode, self.target_fps, self.current_size
         );
         // Mark the current resize value as seen before cloning.
         let _ = self.resize_rx.borrow_and_update();
@@ -128,18 +128,16 @@ impl RdpServerDisplay for MacDisplay {
     fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
         if let Some(monitor) = layout.monitors().first() {
             let (w, h) = monitor.dimensions();
-            // Cap resolution to prevent issues with Microsoft RDP which doesn't
-            // properly handle dynamic resolution changes. Retina displays can
-            // request very high resolutions (e.g. 2940×1846) that cause disconnects.
-            let max_width = 2560u32;
-            let max_height = 1440u32;
+            // Clamp to u16::MAX (RDP protocol limit for single dimension)
+            // but don't cap to arbitrary small values like 2560x1440.
+            // The client knows its display size and we should honor it.
             let size = DesktopSize {
-                width:  w.min(max_width).min(u16::MAX as u32) as u16,
-                height: h.min(max_height).min(u16::MAX as u32) as u16,
+                width:  w.min(u16::MAX as u32) as u16,
+                height: h.min(u16::MAX as u32) as u16,
             };
             debug!(
-                "request_layout: client wants {}×{} (capped to {}×{}), current_size={:?}",
-                w, h, size.width, size.height, self.current_size
+                "request_layout: client wants {}×{}, current_size={:?}",
+                size.width, size.height, self.current_size
             );
             if self.current_size == Some(size) {
                 debug!("request_layout: already at {}×{}, skipping", size.width, size.height);
@@ -270,17 +268,39 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                 if self.missed_frames >= 30 {
                     // After ~1s of continuous nulls, try a full stream reset
                     warn!("SCKit stream stalled ({} missed frames), recreating", self.missed_frames);
-                    if let Ok(new_stream) = create_stream(
-                        self.stream_size.width, self.stream_size.height,
-                        self.mode, self.target_fps,
+                    if let Err(e) = self.recreate_stream(
+                        self.stream_size.width, self.stream_size.height
                     ).await {
-                        self.stream = new_stream;
+                        warn!("Failed to recreate stalled stream: {e}");
+                    } else {
                         self.missed_frames = 0;
                     }
                 }
                 continue;
             };
             self.missed_frames = 0;
+
+            // Check if the frame size differs from what we expect.
+            // This can happen if the display resolution changed without
+            // going through the DisplayControl channel.
+            let frame_w = pixel_buf.width() as u16;
+            let frame_h = pixel_buf.height() as u16;
+            if frame_w != self.stream_size.width || frame_h != self.stream_size.height {
+                debug!(
+                    "Frame size mismatch: expected {}×{}, got {}×{}",
+                    self.stream_size.width, self.stream_size.height, frame_w, frame_h
+                );
+                // Recreate stream at the actual frame size
+                if let Err(e) = self.recreate_stream(frame_w, frame_h).await {
+                    warn!("Failed to recreate stream: {e}");
+                    continue;
+                }
+                // Return a resize update so the RDP client knows about the change
+                return Ok(Some(DisplayUpdate::Resize(DesktopSize {
+                    width: frame_w,
+                    height: frame_h,
+                })));
+            }
 
             match self.mode {
                 CaptureMode::Bgra => {
@@ -303,6 +323,30 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 }
 
 impl MacDisplayUpdates {
+    /// Recreate the stream and encoder at a new resolution.
+    /// Called when we detect the actual frame size differs from stream_size.
+    async fn recreate_stream(&mut self, new_width: u16, new_height: u16) -> Result<()> {
+        debug!(
+            "Recreating stream: {}×{} → {}×{}",
+            self.stream_size.width, self.stream_size.height, new_width, new_height
+        );
+        // Stop the old stream
+        if let Err(e) = self.stream.stop_capture() {
+            debug!("stop_capture during recreate: {e}");
+        }
+        // Create new stream at the new size
+        self.stream = create_stream(new_width, new_height, self.mode, self.target_fps).await?;
+        self.stream_size = DesktopSize { width: new_width, height: new_height };
+        // Recreate H.264 encoder if needed
+        if self.mode == CaptureMode::H264 {
+            self.h264_encoder = Some(VtH264Encoder::new(new_width, new_height)?);
+        }
+        // Reset prev frame so we get a full refresh
+        self.prev = None;
+        self.pending.clear();
+        Ok(())
+    }
+
     /// Handle a BGRA frame (the original path).
     /// Returns `Some(DisplayUpdate)` when there's something to send,
     /// or `None` if the frame was identical to the previous one.
@@ -478,7 +522,7 @@ fn make_bitmap(data: Bytes, w: usize, h: usize, stride: usize) -> Result<BitmapU
         y: 0,
         width:  NonZeroU16::new(w as u16).ok_or_else(|| anyhow!("zero width"))?,
         height: NonZeroU16::new(h as u16).ok_or_else(|| anyhow!("zero height"))?,
-        format: PixelFormat::ARgb32,
+        format: PixelFormat::BgrA32,
         data,
         stride: NonZeroUsize::new(stride).ok_or_else(|| anyhow!("zero stride"))?,
     })

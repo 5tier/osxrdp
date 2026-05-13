@@ -779,14 +779,24 @@ impl RdpServer {
                     };
                     let display_size = self.display.lock().await.size().await;
 
-                    // It's problematic when the client didn't resize, as we send bitmap updates that don't fit.
-                    // The client will likely drop the connection.
-                    if client_size.width < display_size.width || client_size.height < display_size.height {
-                        // TODO: we may have different behaviour instead, such as clipping or scaling?
-                        warn!(
-                            "Client size doesn't fit the server size: {:?} < {:?}",
-                            client_size, display_size
+                    // If the client size is different from the display size,
+                    // resize the display to match the client.
+                    // This prevents sending oversized frames that the client can't handle.
+                    if client_size.width != display_size.width || client_size.height != display_size.height {
+                        debug!(
+                            "Resizing display to match client: {:?} -> {:?}",
+                            display_size, client_size
                         );
+                        // Create a synthetic monitor layout to trigger the resize
+                        // No scale factor or physical dimensions needed for resize
+                        if let Ok(layout) = DisplayControlMonitorLayout::new_single_primary_monitor(
+                            client_size.width as u32,
+                            client_size.height as u32,
+                            None,  // scale_factor
+                            None,  // physical_dims
+                        ) {
+                            self.display.lock().await.request_layout(layout);
+                        }
                     }
                 }
                 CapabilitySet::SurfaceCommands(c) => {

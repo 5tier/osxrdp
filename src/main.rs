@@ -73,7 +73,10 @@ async fn main() -> Result<()> {
     permissions::check_and_warn().await;
 
     let addr = std::env::var("OSXRDP_ADDR").unwrap_or_else(|_| "0.0.0.0:3389".to_string());
-    let h264 = std::env::var("OSXRDP_H264").unwrap_or_else(|_| "1".to_string()) == "1";
+    // H.264 mode is disabled by default because the GFX server doesn't
+    // handle dynamic resize properly (size mismatch between display stream
+    // and GFX surface). Use BGRA mode until this is fixed.
+    let h264 = std::env::var("OSXRDP_H264").unwrap_or_else(|_| "0".to_string()) == "1";
 
     let mode = if h264 { CaptureMode::H264 } else { CaptureMode::Bgra };
 
