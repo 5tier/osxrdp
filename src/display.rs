@@ -128,16 +128,34 @@ impl RdpServerDisplay for MacDisplay {
     fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
         if let Some(monitor) = layout.monitors().first() {
             let (w, h) = monitor.dimensions();
-            // Clamp to u16::MAX (RDP protocol limit for single dimension)
-            // but don't cap to arbitrary small values like 2560x1440.
-            // The client knows its display size and we should honor it.
+            
+            // Adjust to 16:10 aspect ratio
+            // This ensures the display matches common monitor ratios
+            let target_ratio = 16.0 / 10.0; // 1.6
+            
+            // Calculate 16:10 resolution that fits within client window
+            // Option 1: Fit by width
+            let new_w1 = w;
+            let new_h1 = (w as f64 / target_ratio) as u32;
+            
+            // Option 2: Fit by height
+            let new_h2 = h;
+            let new_w2 = (h as f64 * target_ratio) as u32;
+            
+            // Choose the option that fits within (w, h)
+            let (new_w, new_h) = if new_h1 <= h {
+                (new_w1, new_h1)
+            } else {
+                (new_w2, new_h2)
+            };
+            
             let size = DesktopSize {
-                width:  w.min(u16::MAX as u32) as u16,
-                height: h.min(u16::MAX as u32) as u16,
+                width:  new_w.min(u16::MAX as u32) as u16,
+                height: new_h.min(u16::MAX as u32) as u16,
             };
             debug!(
-                "request_layout: client wants {}×{}, current_size={:?}",
-                size.width, size.height, self.current_size
+                "request_layout: client wants {}×{}, adjusted to 16:10 {}×{}",
+                w, h, size.width, size.height
             );
             if self.current_size == Some(size) {
                 debug!("request_layout: already at {}×{}, skipping", size.width, size.height);
