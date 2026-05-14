@@ -451,17 +451,21 @@ pub struct CreateSurfacePdu {
 impl CreateSurfacePdu {
     const NAME: &'static str = "CreateSurfacePdu";
 
-    const FIXED_PART_SIZE: usize = 2 /* SurfaceId */ + 2 /* Width */ + 2 /* Height */ + 1 /* PixelFormat */;
+    // Per [MS-RDPEGFX] 2.2.2.8, pixelFormat is RDPGFX_PIXEL_FORMAT (4 bytes),
+    // NOT a single byte. The ironrdp-pdu upstream bug encodes it as u8.
+    const FIXED_PART_SIZE: usize = 2 /* SurfaceId */ + 2 /* Width */ + 2 /* Height */ + 4 /* PixelFormat */;
 }
 
 impl Encode for CreateSurfacePdu {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        ensure_fixed_part_size!(in: dst);
+        ensure_size!(in: dst, size: self.size());
 
         dst.write_u16(self.surface_id);
         dst.write_u16(self.width);
         dst.write_u16(self.height);
-        dst.write_u8(self.pixel_format.as_u8());
+        // RDPGFX_PIXEL_FORMAT is a 4-byte field per spec.
+        // XRgb = 0x00000020, ARgb = 0x00000021
+        dst.write_u32(self.pixel_format.as_u8() as u32);
 
         Ok(())
     }
@@ -477,12 +481,13 @@ impl Encode for CreateSurfacePdu {
 
 impl<'a> Decode<'a> for CreateSurfacePdu {
     fn decode(src: &mut ReadCursor<'a>) -> DecodeResult<Self> {
-        ensure_fixed_part_size!(in: src);
+        ensure_size!(in: src, size: Self::FIXED_PART_SIZE);
 
         let surface_id = src.read_u16();
         let width = src.read_u16();
         let height = src.read_u16();
-        let pixel_format = PixelFormat::from_u8(src.read_u8())
+        // RDPGFX_PIXEL_FORMAT is 4 bytes per spec
+        let pixel_format = PixelFormat::from_u8((src.read_u32() & 0xFF) as u8)
             .ok_or_else(|| invalid_field_err!("pixelFormat", "invalid pixel format"))?;
 
         Ok(Self {

@@ -251,6 +251,10 @@ pub struct RdpServer {
     handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
     display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
     gfx_server: Option<Arc<std::sync::Mutex<crate::gfx::GfxServer>>>,
+    /// Shared flag to force the H.264 encoder to produce a keyframe.
+    /// Set by the GFX pipeline when GfxServer::needs_keyframe() is true,
+    /// checked by MacDisplayUpdates before each encode call.
+    force_keyframe: Option<Arc<std::sync::atomic::AtomicBool>>,
     static_channels: StaticChannelSet,
     sound_factory: Option<Box<dyn SoundServerFactory>>,
     cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
@@ -315,6 +319,7 @@ impl RdpServer {
             creds: None,
             authenticate: None,
             local_addr: None,
+            force_keyframe: None,
         }
     }
 
@@ -325,6 +330,12 @@ impl RdpServer {
     /// Set the shared GfxServer for H.264 AVC420 frame transport.
     pub fn set_gfx_server(&mut self, gfx: Arc<std::sync::Mutex<crate::gfx::GfxServer>>) {
         self.gfx_server = Some(gfx);
+    }
+
+    /// Set a shared flag to force H.264 keyframe generation.
+    /// The display loop checks this flag before encoding each frame.
+    pub fn set_force_keyframe(&mut self, flag: Arc<std::sync::atomic::AtomicBool>) {
+        self.force_keyframe = Some(flag);
     }
 
     pub fn event_sender(&self) -> &mpsc::UnboundedSender<ServerEvent> {
@@ -353,9 +364,11 @@ impl RdpServer {
             })
             .with_dynamic_channel(DisplayControlServer::new(Box::new(dcs_backend)));
 
-        // Register GfxServer as a DVC channel if configured
-        if let Some(gfx) = self.gfx_server.take() {
-            dvc = dvc.with_dynamic_channel(crate::gfx::SharedGfxServer::new(gfx));
+        // Register GfxServer as a DVC channel if configured.
+        // Use Arc::clone (not take) so gfx_server remains available for
+        // deactivation-reactivation cycles.
+        if let Some(gfx) = self.gfx_server.as_ref() {
+            dvc = dvc.with_dynamic_channel(crate::gfx::SharedGfxServer::new(Arc::clone(gfx)));
         }
 
         acceptor.attach_static_channel(dvc);
@@ -652,6 +665,7 @@ impl RdpServer {
         debug!("Starting client loop");
         let mut display_updates = self.display.lock().await.updates().await?;
         let gfx_server = self.gfx_server.clone();
+        let force_keyframe = self.force_keyframe.clone();
         let mut writer = SharedWriter::new(writer);
         let mut display_writer = writer.clone();
         let mut event_writer = writer.clone();
@@ -679,24 +693,132 @@ impl RdpServer {
             loop {
                 match display_updates.next_update().await {
                     Ok(Some(update)) => {
-                    // Intercept Avc420 updates and route through GFX channel
-                    if let DisplayUpdate::Avc420(ref avc) = update {
+                    // Intercept Resize updates when GFX is active.
+                    // Instead of deactivation-reactivation (which breaks DVC channels),
+                    // resize the GFX surface in-place and continue.
+                    if let DisplayUpdate::Resize(desktop_size) = &update {
+                        debug!(?desktop_size, "Display resize");
                         if let Some(ref gfx) = gfx_server {
-                            let mut gfx = gfx.lock().unwrap();
-                            if gfx.is_active() {
-                                gfx.send_avc420_frame(
+                            let mut gfx_lock = gfx.lock().unwrap();
+                            // Only use the GFX resize path if AVC420 is enabled.
+                            // When AVC420 is disabled, bitmap updates go through
+                            // SurfaceCommands and need deactivation-reactivation.
+                            if gfx_lock.is_active() && gfx_lock.avc420_enabled() {
+                                debug!(
+                                    "GFX resize: {}×{} → {}×{}",
+                                    gfx_lock.desktop_width(), gfx_lock.desktop_height(),
+                                    desktop_size.width, desktop_size.height,
+                                );
+                                gfx_lock.set_desktop_size(desktop_size.width, desktop_size.height);
+                                gfx_lock.init_surface();
+                                // Flush init_surface PDUs to the client.
+                                let pending = gfx_lock.drain_pending();
+                                if !pending.is_empty() {
+                                    let dynamic_channel_id = gfx_lock.channel_id();
+                                    let drdynvc_id = gfx_lock.drdynvc_channel_id();
+                                    if let (Some(dyn_id), Some(drdynvc_id)) = (dynamic_channel_id, drdynvc_id) {
+                                        debug!("Flushing {} pending GFX PDUs (resize)", pending.len());
+                                        match dvc::encode_dvc_messages(dyn_id, pending, ironrdp_svc::ChannelFlags::SHOW_PROTOCOL) {
+                                            Ok(svc_messages) => {
+                                                match server_encode_svc_messages(svc_messages, drdynvc_id, user_channel_id) {
+                                                    Ok(encoded) => {
+                                                        if let Err(e) = display_writer.write_all(&encoded).await {
+                                                            warn!("Failed to write GFX PDUs: {e}");
+                                                        }
+                                                    }
+                                                    Err(e) => warn!("Failed to encode GFX SVC messages: {e}"),
+                                                }
+                                            }
+                                            Err(e) => warn!("Failed to encode GFX DVC messages: {e}"),
+                                        }
+                                    }
+                                }
+                                continue; // Resize handled by GFX, skip dispatch_display_update
+                            }
+                        }
+                        // GFX not active — fall through to dispatch_display_update
+                        // which will trigger deactivation-reactivation.
+                    }
+                    // Intercept Avc420 updates and route through the GFX channel.
+                    // When the GFX channel is active, send frames directly.
+                    // When not yet active (channel setup still in progress),
+                    // skip the frame — the next frame will go through once active.
+                    if let DisplayUpdate::Avc420(ref avc) = update {
+                        debug!("Avc420 update: {}×{} keyframe={}", avc.width, avc.height, avc.is_keyframe);
+                        if let Some(ref gfx) = gfx_server {
+                            let mut gfx_lock = gfx.lock().unwrap();
+                            debug!("GFX active={}, channel_id={:?}, drdynvc_id={:?}, needs_keyframe={}",
+                                gfx_lock.is_active(), gfx_lock.channel_id(), gfx_lock.drdynvc_channel_id(),
+                                gfx_lock.needs_keyframe());
+                            if gfx_lock.is_active() {
+                                // Skip P-frames until a keyframe arrives. The client
+                                // can't decode P-frames without a preceding keyframe.
+                                // Force the encoder to produce a keyframe on the next
+                                // frame so we don't wait for the natural keyframe interval.
+                                if gfx_lock.needs_keyframe() && !avc.is_keyframe {
+                                    debug!("Skipping P-frame: need keyframe first, signaling encoder");
+                                    if let Some(ref flag) = force_keyframe {
+                                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    continue;
+                                }
+                                // Mark keyframe received.
+                                if avc.is_keyframe {
+                                    gfx_lock.clear_needs_keyframe();
+                                }
+                                // Update GFX surface to match frame dimensions if needed.
+                                if gfx_lock.desktop_width() != avc.width || gfx_lock.desktop_height() != avc.height {
+                                    debug!(
+                                        "GFX surface resize: {}×{} → {}×{}",
+                                        gfx_lock.desktop_width(), gfx_lock.desktop_height(),
+                                        avc.width, avc.height,
+                                    );
+                                    gfx_lock.set_desktop_size(avc.width, avc.height);
+                                    gfx_lock.init_surface();
+                                }
+                                gfx_lock.send_avc420_frame(
                                     avc.data.clone(),
                                     avc.width,
                                     avc.height,
-                                    28, // default quantization parameter
+                                    28, // quantization parameter
                                     avc.is_keyframe,
                                 );
-                                // Flush GFX PDUs: encode as DVC messages and write
-                                // TODO: drain pending PDUs through drdynvc static channel
-                                // For now, the PDUs accumulate in GfxServer until
-                                // a client PDU triggers process() which drains them.
-                                // This will be improved in a follow-up.
+                                // Proactively flush GFX PDUs to the client.
+                                // The GFX channel PDUs accumulate in pending until
+                                // flushed. Without proactive flushing, the client
+                                // would only receive PDUs when it sends data to
+                                // the GFX channel, causing severe latency.
+                                let pending = gfx_lock.drain_pending();
+                                if !pending.is_empty() {
+                                    let dynamic_channel_id = gfx_lock.channel_id();
+                                    let drdynvc_id = gfx_lock.drdynvc_channel_id();
+                                    if let (Some(dyn_id), Some(drdynvc_id)) = (dynamic_channel_id, drdynvc_id) {
+                                        debug!("Flushing {} pending GFX PDUs", pending.len());
+                                        match dvc::encode_dvc_messages(dyn_id, pending, ironrdp_svc::ChannelFlags::SHOW_PROTOCOL) {
+                                            Ok(svc_messages) => {
+                                                match server_encode_svc_messages(svc_messages, drdynvc_id, user_channel_id) {
+                                                    Ok(encoded) => {
+                                                        if let Err(e) = display_writer.write_all(&encoded).await {
+                                                            warn!("Failed to write GFX PDUs: {e}");
+                                                        }
+                                                    }
+                                                    Err(e) => warn!("Failed to encode GFX SVC messages: {e}"),
+                                                }
+                                            }
+                                            Err(e) => warn!("Failed to encode GFX DVC messages: {e}"),
+                                        }
+                                    }
+                                }
+                            } else {
+                                debug!("GFX not active, skipping Avc420 frame (will retry on next frame)");
+                                // Signal the encoder to produce a keyframe when the GFX
+                                // channel becomes active, so we can send it immediately.
+                                if let Some(ref flag) = force_keyframe {
+                                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
                             }
+                        } else {
+                            warn!("Avc420 update but no GfxServer configured");
                         }
                         continue; // skip the normal SurfaceCommand path
                     }
@@ -787,6 +909,17 @@ impl RdpServer {
         }
 
         self.static_channels = result.static_channels;
+
+        // Set the drdynvc static channel ID on the GfxServer so it can flush
+        // PDUs proactively without waiting for client messages.
+        if let Some(gfx) = self.gfx_server.as_ref() {
+            let drdynvc_id = self.static_channels
+                .get_channel_id_by_type::<ironrdp_dvc::DrdynvcServer>();
+            if let Some(id) = drdynvc_id {
+                gfx.lock().unwrap().set_drdynvc_channel_id(id);
+                debug!("GFX: set drdynvc static channel id={id}");
+            }
+        }
         if !result.reactivation {
             for (_type_id, channel, channel_id) in self.static_channels.iter_mut() {
                 debug!(?channel, ?channel_id, "Start");
@@ -838,6 +971,23 @@ impl RdpServer {
                             None,  // physical_dims
                         ) {
                             self.display.lock().await.request_layout(layout);
+                        }
+                    }
+
+                    // Update the GfxServer desktop size AFTER request_layout() so that
+                    // any display mode switch is reflected. The GFX surface must match
+                    // the H264 frame dimensions, which come from the physical display
+                    // (e.g. after mode switching to 1280×800).
+                    let new_display_size = self.display.lock().await.size().await;
+                    if let Some(gfx) = self.gfx_server.as_ref() {
+                        let mut gfx_lock = gfx.lock().unwrap();
+                        if gfx_lock.desktop_width() != new_display_size.width || gfx_lock.desktop_height() != new_display_size.height {
+                            debug!(
+                                "GFX desktop size update to display size: {}×{} → {}×{}",
+                                gfx_lock.desktop_width(), gfx_lock.desktop_height(),
+                                new_display_size.width, new_display_size.height
+                            );
+                            gfx_lock.set_desktop_size(new_display_size.width, new_display_size.height);
                         }
                     }
                 }

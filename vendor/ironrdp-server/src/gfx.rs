@@ -12,18 +12,21 @@
 
 use ironrdp_core::{decode, encode_vec, impl_as_any};
 use ironrdp_dvc::{DvcEncode, DvcMessage, DvcProcessor, DvcServerProcessor};
+use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_pdu::geometry::InclusiveRectangle;
 use ironrdp_pdu::PduResult;
 use ironrdp_pdu::rdp::vc::dvc::gfx::{
     Avc420BitmapStream, CapabilitiesAdvertisePdu, CapabilitiesConfirmPdu, CapabilitiesV81Flags,
-    CapabilitiesV8Flags, CapabilitySet, Codec1Type, CreateSurfacePdu, EndFramePdu, FrameAcknowledgePdu,
+    CapabilitiesV8Flags, CapabilitiesV10Flags, CapabilitiesV103Flags,
+    CapabilitySet, Codec1Type, CreateSurfacePdu, EndFramePdu, FrameAcknowledgePdu,
     MapSurfaceToOutputPdu, PixelFormat, QuantQuality, ResetGraphicsPdu, ServerPdu, StartFramePdu,
     Timestamp, WireToSurface1Pdu,
 };
 use ironrdp_pdu::rdp::vc::dvc::gfx::ClientPdu;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 // ─── GFX channel name ──────────────────────────────────────────────────────
 
@@ -59,6 +62,18 @@ pub struct GfxServer {
     /// Desktop size for surface creation.
     desktop_width: u16,
     desktop_height: u16,
+    /// The DVC channel ID assigned by drdynvc when the channel starts.
+    channel_id: Option<u32>,
+    /// The drdynvc static channel ID (MCS channel ID).
+    drdynvc_channel_id: Option<u16>,
+    /// Whether the server needs to send a keyframe before P-frames.
+    /// Set to true on init_surface (new surface = new keyframe needed).
+    needs_keyframe: bool,
+    /// Shared flag: true when the client supports AVC420.
+    /// Set to false during capability negotiation when the client
+    /// advertises AVC_DISABLED. The display module reads this flag
+    /// to fall back to BGRA bitmap updates when H.264 is not supported.
+    avc420_enabled: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for GfxServer {
@@ -81,6 +96,10 @@ impl GfxServer {
             pending: VecDeque::new(),
             desktop_width,
             desktop_height,
+            channel_id: None,
+            drdynvc_channel_id: None,
+            needs_keyframe: true,
+            avc420_enabled: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -174,20 +193,55 @@ impl GfxServer {
         })));
     }
 
-    /// Check if the client advertised AVC420 support.
+    /// Check if the client advertised AVC420 support **on a version the
+    /// server can confirm**.
+    ///
+    /// The server always confirms V8.1 because its `ResetGraphicsPdu`
+    /// only encodes the simple V8-format Monitor entries (no
+    /// `desktopSurfaceId`/`surfaceId` fields required by V10.4+).
+    /// Therefore we can only use AVC420 if the client has V8.1 with
+    /// `AVC420_ENABLED`, or V10/V10.2/V10.3 without `AVC_DISABLED`
+    /// (these versions also use the simple monitor format).
+    ///
+    /// V10.4+ without `AVC_DISABLED` is **not** sufficient because
+    /// confirming V10.4 requires the extended monitor format.
     pub fn client_supports_avc420(&self) -> bool {
         self.client_caps
             .as_ref()
             .is_some_and(|caps| caps.0.iter().any(|cs| {
-                matches!(cs, CapabilitySet::V8_1 { flags } if flags.contains(CapabilitiesV81Flags::AVC420_ENABLED))
-                    || matches!(cs, CapabilitySet::V10_2 { .. })
-                    || matches!(cs, CapabilitySet::V10_3 { .. })
-                    || matches!(cs, CapabilitySet::V10_4 { .. })
-                    || matches!(cs, CapabilitySet::V10_5 { .. })
-                    || matches!(cs, CapabilitySet::V10_6 { .. })
-                    || matches!(cs, CapabilitySet::V10_6Err { .. })
-                    || matches!(cs, CapabilitySet::V10_7 { .. })
+                match cs {
+                    // V8.1: explicit AVC420_ENABLED flag
+                    CapabilitySet::V8_1 { flags } => flags.contains(CapabilitiesV81Flags::AVC420_ENABLED),
+                    // V10 / V10.2: CapabilitiesV10Flags — AVC420 implied if AVC_DISABLED is NOT set
+                    // (these versions use the simple V8-format monitor entries)
+                    CapabilitySet::V10 { flags }
+                    | CapabilitySet::V10_2 { flags } => !flags.contains(CapabilitiesV10Flags::AVC_DISABLED),
+                    // V10.3: CapabilitiesV103Flags (also simple monitor format)
+                    CapabilitySet::V10_3 { flags } => !flags.contains(CapabilitiesV103Flags::AVC_DISABLED),
+                    // V10.4+ requires extended monitor format — server can't confirm these,
+                    // so we don't consider them as AVC420 support.
+                    _ => false,
+                }
             }))
+    }
+
+    /// Set the shared AVC420-enabled flag.
+    ///
+    /// The display module holds a clone of the same `Arc` and checks it
+    /// each frame. When the client advertises `AVC_DISABLED`, this flag
+    /// is set to `false`, causing the display to fall back to BGRA.
+    pub fn set_avc420_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.avc420_enabled = flag;
+    }
+
+    /// Get a clone of the shared AVC420-enabled flag.
+    pub fn avc420_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.avc420_enabled)
+    }
+
+    /// Whether the client actually supports AVC420 (read from the shared flag).
+    pub fn avc420_enabled(&self) -> bool {
+        self.avc420_enabled.load(Ordering::Relaxed)
     }
 
     /// Whether the GFX pipeline is active and ready to send frames.
@@ -199,19 +253,41 @@ impl GfxServer {
         debug!("GFX: client capabilities: {:?}", caps.0);
         self.client_caps = Some(caps.clone());
 
-        // Pick the highest version the client supports that we also support.
-        let confirmed = if let Some(best) = caps.0.iter().find(|cs| {
-            matches!(cs, CapabilitySet::V10_7 { .. })
-        }) {
-            best.clone()
-        } else if let Some(best) = caps.0.iter().find(|cs| {
-            matches!(cs, CapabilitySet::V10_4 { .. } | CapabilitySet::V10_5 { .. } | CapabilitySet::V10_6 { .. } | CapabilitySet::V10_6Err { .. })
-        }) {
-            best.clone()
-        } else if let Some(best) = caps.0.iter().find(|cs| {
+        // Check whether the client actually supports AVC420.
+        // Some clients (e.g. Microsoft Remote Desktop on macOS) advertise
+        // V10/V10.2/V10.3 with AVC_DISABLED, meaning they explicitly
+        // opt out of H.264 even though they support the GFX pipeline.
+        let avc_ok = self.client_supports_avc420();
+        self.avc420_enabled.store(avc_ok, Ordering::Relaxed);
+        if !avc_ok {
+            info!(
+                "GFX: client does not support AVC420 (AVC_DISABLED), \
+                 falling back to BGRA bitmap updates"
+            );
+            // Don't confirm capabilities or init the surface.
+            // Sending GFX init PDUs (ResetGraphics/CreateSurface/MapSurfaceToOutput)
+            // to a client that doesn't want AVC420 causes the client to close
+            // the GFX channel and sometimes disconnect entirely.
+            //
+            // Instead, leave the GFX channel in WaitingCapabilities state.
+            // The display module detects avc420_enabled=false and falls back
+            // to BGRA bitmap updates via the normal SurfaceCommand path.
+            //
+            // We still return the pending PDUs (empty) so the caller knows
+            // we processed the capabilities.
+            return;
+        }
+
+        // Confirm the best matching capability version.
+        // We prefer V8.1 because our Monitor struct in ResetGraphicsPdu
+        // only encodes V8-format entries (no desktopSurfaceId/surfaceId
+        // fields needed by V10.4+).
+        let confirmed = if let Some(_best) = caps.0.iter().find(|cs| {
             matches!(cs, CapabilitySet::V8_1 { .. })
         }) {
-            best.clone()
+            CapabilitySet::V8_1 {
+                flags: CapabilitiesV81Flags::SMALL_CACHE | CapabilitiesV81Flags::AVC420_ENABLED,
+            }
         } else if let Some(best) = caps.0.iter().find(|cs| {
             matches!(cs, CapabilitySet::V8 { .. })
         }) {
@@ -229,14 +305,33 @@ impl GfxServer {
 
         self.state = GfxState::Ready;
         self.init_surface();
+
+        // Log the PDUs we're sending for debugging
+        for pdu in &self.pending {
+            let size = pdu.size();
+            let mut buf = vec![0u8; size];
+            use ironrdp_pdu::cursor::WriteCursor;
+            if let Err(e) = pdu.encode(&mut WriteCursor::new(&mut buf)) {
+                warn!("Failed to encode init PDU: {e}");
+            } else {
+                debug!("Init PDU bytes ({} bytes): {:02x?}", buf.len(), &buf[..buf.len().min(64)]);
+            }
+        }
     }
 
-    fn init_surface(&mut self) {
+    pub fn init_surface(&mut self) {
         // Reset graphics
+        self.needs_keyframe = true; // New surface = need keyframe
         self.pending.push_back(wrap_pdu(ServerPdu::ResetGraphics(ResetGraphicsPdu {
             width: self.desktop_width as u32,
             height: self.desktop_height as u32,
-            monitors: vec![],
+            monitors: vec![Monitor {
+                left: 0,
+                top: 0,
+                right: self.desktop_width as i32 - 1,
+                bottom: self.desktop_height as i32 - 1,
+                flags: MonitorFlags::PRIMARY,
+            }],
         })));
 
         // Create a single surface
@@ -267,10 +362,47 @@ impl GfxServer {
         debug!("GFX: frame acknowledge: id={}, depth={:?}", ack.frame_id, ack.queue_depth);
     }
 
-    /// Update the desktop size (for deactivation-reactivation).
+    /// Update the desktop size (for deactivation-reactivation or
+    /// resizing when the client requests a different resolution).
     pub fn set_desktop_size(&mut self, width: u16, height: u16) {
         self.desktop_width = width;
         self.desktop_height = height;
+    }
+
+    /// Returns the current desktop width configured for the GFX surface.
+    pub fn desktop_width(&self) -> u16 {
+        self.desktop_width
+    }
+
+    /// Returns the current desktop height configured for the GFX surface.
+    pub fn desktop_height(&self) -> u16 {
+        self.desktop_height
+    }
+
+    /// Returns the DVC channel ID assigned by drdynvc, or None if not yet started.
+    pub fn channel_id(&self) -> Option<u32> {
+        self.channel_id
+    }
+
+    /// Set the drdynvc static channel ID (MCS channel ID) for outbound PDU encoding.
+    pub fn set_drdynvc_channel_id(&mut self, id: u16) {
+        self.drdynvc_channel_id = Some(id);
+    }
+
+    /// Returns the drdynvc static channel ID (MCS channel ID).
+    pub fn drdynvc_channel_id(&self) -> Option<u16> {
+        self.drdynvc_channel_id
+    }
+
+    /// Whether a keyframe is needed before sending P-frames.
+    /// Returns true after init_surface() until a keyframe is sent.
+    pub fn needs_keyframe(&self) -> bool {
+        self.needs_keyframe
+    }
+
+    /// Mark that a keyframe has been sent (no longer needs one).
+    pub fn clear_needs_keyframe(&mut self) {
+        self.needs_keyframe = false;
     }
 
     /// Drain all pending server PDUs.
@@ -286,8 +418,12 @@ impl DvcProcessor for GfxServer {
         GFX_CHANNEL_NAME
     }
 
-    fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
-        debug!("GFX DVC channel started");
+    fn start(&mut self, channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+        debug!("GFX DVC channel started, id={channel_id}");
+        self.state = GfxState::WaitingCapabilities;
+        self.channel_id = Some(channel_id);
+        self.client_caps = None;
+        self.pending.clear();
         // We don't send anything until the client advertises capabilities.
         Ok(Vec::new())
     }
@@ -318,6 +454,7 @@ impl DvcProcessor for GfxServer {
     fn close(&mut self, _channel_id: u32) {
         debug!("GFX DVC channel closed");
         self.state = GfxState::WaitingCapabilities;
+        self.channel_id = None;
     }
 }
 

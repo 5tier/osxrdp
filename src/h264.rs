@@ -215,6 +215,10 @@ static EXPECT_REALTIME: OnceLock<CfKey> = OnceLock::new();
     pub unsafe fn not_sync() -> CfKey {
         *NOT_SYNC.get_or_init(|| CfKey::new(b"NotSync\0"))
     }
+    pub unsafe fn force_key_frame() -> CfKey {
+        static FORCE_KEY_FRAME: OnceLock<CfKey> = OnceLock::new();
+        *FORCE_KEY_FRAME.get_or_init(|| CfKey::new(b"VTCompressionPropertyKey_ForceKeyFrame\0"))
+    }
 }
 
 // ─── Callback ───────────────────────────────────────────────────────────────
@@ -509,6 +513,29 @@ impl VtH264Encoder {
     pub fn width(&self) -> u16 { self.width }
     #[allow(dead_code)]
     pub fn height(&self) -> u16 { self.height }
+
+    /// Force the next encoded frame to be a keyframe (I-frame).
+    ///
+    /// Call this before `encode()` when a keyframe is needed immediately,
+    /// e.g. when a new GFX surface is created and the client needs a
+    /// reference frame before it can decode P-frames.
+    pub fn force_keyframe(&mut self) {
+        if self.session.is_null() {
+            return;
+        }
+        unsafe {
+            let key = vt_keys::force_key_frame();
+            let status = VTSessionSetProperty(self.session, key.as_ptr(), kCFBooleanTrue);
+            if status != 0 {
+                // -12900 = kVTPropertyNotSupportedErr: property not available
+                // on this encoder version. Fall back to relying on natural
+                // keyframe interval.
+                debug!("VTSessionSetProperty(ForceKeyFrame) returned {status}, relying on natural keyframe interval");
+            } else {
+                debug!("Forced next H.264 frame to be a keyframe");
+            }
+        }
+    }
 }
 
 impl Drop for VtH264Encoder {

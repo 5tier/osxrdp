@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -115,6 +117,18 @@ pub struct MacDisplay {
     /// the change before creating an SCKit stream. This field stores the
     /// switched resolution, and `updates()` sleeps before creating the stream.
     mode_switch_pending: Option<DesktopSize>,
+    /// True after any display mode switch. CGDisplay must be used for ALL
+    /// subsequent streams because SCKit crashes after a mode switch (macOS
+    /// bug). This persists across deactivation-reactivation cycles.
+    cg_display_forced: bool,
+    /// Shared flag to force H.264 keyframe. Server.rs sets this when the
+    /// GfxServer needs a keyframe; the encoder polls it before encode().
+    force_keyframe: Arc<AtomicBool>,
+    /// Shared flag: true when the client supports AVC420.
+    /// The GfxServer sets this to `false` during capability negotiation
+    /// when the client advertises AVC_DISABLED. The display module checks
+    /// it each frame and falls back to BGRA bitmap updates if false.
+    avc420_enabled: Arc<AtomicBool>,
 }
 
 impl MacDisplay {
@@ -131,6 +145,9 @@ impl MacDisplay {
             aspect_mode: aspect_mode_from_env(),
             mode_switcher: None,
             mode_switch_pending: None,
+            cg_display_forced: false,
+            force_keyframe: Arc::new(AtomicBool::new(false)),
+            avc420_enabled: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -147,6 +164,9 @@ impl MacDisplay {
             aspect_mode: aspect_mode_from_env(),
             mode_switcher: None,
             mode_switch_pending: None,
+            cg_display_forced: false,
+            force_keyframe: Arc::new(AtomicBool::new(false)),
+            avc420_enabled: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -166,6 +186,23 @@ impl MacDisplay {
             );
             self.native_size = Some(native);
         }
+    }
+
+    /// Get a reference to the shared force_keyframe flag.
+    /// The server sets this when the GfxServer needs a keyframe;
+    /// the encoder checks it before each encode call.
+    pub fn force_keyframe_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.force_keyframe)
+    }
+
+    /// Set the shared AVC420-enabled flag.
+    ///
+    /// The GfxServer holds a clone of the same `Arc`. During GFX
+    /// capability negotiation, if the client advertises `AVC_DISABLED`,
+    /// the flag is set to `false`. The display module checks it each
+    /// frame and falls back to BGRA bitmap updates when false.
+    pub fn set_avc420_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.avc420_enabled = flag;
     }
 }
 
@@ -200,7 +237,9 @@ impl RdpServerDisplay for MacDisplay {
         // If a display mode switch was performed by request_layout(), we must
         // use CGDisplay capture instead of SCKit. SCKit crashes (SIGSEGV)
         // after any display mode change — even from a separate process.
-        let use_cgdisplay = self.mode_switch_pending.is_some();
+        // cg_display_forced persists across deactivation-reactivation cycles
+        // because SCKit remains unusable after the first mode switch.
+        let use_cgdisplay = self.mode_switch_pending.is_some() || self.cg_display_forced;
 
         if let Some(pending) = self.mode_switch_pending.take() {
             info!(
@@ -247,6 +286,8 @@ impl RdpServerDisplay for MacDisplay {
             self.resize_rx.clone(),
             use_cgdisplay,
             mode_switcher,
+            Arc::clone(&self.force_keyframe),
+            Arc::clone(&self.avc420_enabled),
         )
         .await?;
         // After cloning, update the original receiver's version so that
@@ -299,6 +340,7 @@ impl RdpServerDisplay for MacDisplay {
                             self.native_size = None; // will re-query via CGDisplay
                             self.current_size = Some(switched_size);
                             self.mode_switch_pending = Some(switched_size);
+                            self.cg_display_forced = true; // SCKit unusable after mode switch
                             let _ = self.resize_tx.send(Some(switched_size));
                             return;
                         }
@@ -411,6 +453,15 @@ pub struct MacDisplayUpdates {
     /// Display mode switcher. When the stream ends (client disconnects),
     /// the Drop impl restores the original display mode via child process.
     mode_switcher: Option<DisplayModeSwitcher>,
+    /// Shared flag to signal the H.264 encoder that a keyframe is needed.
+    /// Set by server.rs when GfxServer::needs_keyframe() is true,
+    /// checked by the encoder before each encode call.
+    force_keyframe: Arc<AtomicBool>,
+    /// Shared flag: true when the client supports AVC420.
+    /// Set to false by the GfxServer during capability negotiation when
+    /// the client advertises AVC_DISABLED. Checked each frame; when false,
+    /// the display falls back to BGRA bitmap updates.
+    avc420_enabled: Arc<AtomicBool>,
 }
 
 impl MacDisplayUpdates {
@@ -424,6 +475,8 @@ impl MacDisplayUpdates {
         resize_rx: watch::Receiver<Option<DesktopSize>>,
         use_cgdisplay: bool,
         mode_switcher: Option<DisplayModeSwitcher>,
+        force_keyframe: Arc<AtomicBool>,
+        avc420_enabled: Arc<AtomicBool>,
     ) -> Result<Self> {
         let capture = if use_cgdisplay {
             info!(
@@ -460,6 +513,8 @@ impl MacDisplayUpdates {
             missed_frames: 0,
             target_fps,
             mode_switcher,
+            force_keyframe,
+            avc420_enabled,
         })
     }
 }
@@ -489,18 +544,26 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
     async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
         loop {
             // ── 1. Handle pending resize FIRST (before waiting for frames) ────
+            // In BGRA mode, emit a Resize event so the server can resize
+            // the desktop via deactivation-reactivation.
+            // In H264 mode, skip the Resize event — the GfxServer surface is
+            // updated separately via the GFX pipeline, and deactivation-
+            // reactivation would break the DVC channels (including GFX).
             if self.resize_rx.has_changed().unwrap_or(false) {
                 let new_size = self.resize_rx.borrow_and_update().clone();
                 if let Some(size) = new_size {
-                    if size != self.target_size {
-                        debug!(
-                            "Client requested {}×{}, was {}×{} — signalling resize",
-                            size.width, size.height,
-                            self.target_size.width, self.target_size.height,
-                        );
-                        self.target_size = size;
+                    debug!(
+                        "Client resize notification: {}×{} (was {}×{})",
+                        size.width, size.height,
+                        self.target_size.width, self.target_size.height,
+                    );
+                    self.target_size = size;
+                    if self.mode == CaptureMode::Bgra || !self.avc420_enabled.load(Ordering::Relaxed) {
                         return Ok(Some(DisplayUpdate::Resize(size)));
                     }
+                    // In H264 mode, the GfxServer is resized in place via the
+                    // GFX pipeline. No deactivation-reactivation is needed.
+                    debug!("Resize in H264 mode: skipping deactivation-reactivation");
                 }
             }
 
@@ -566,6 +629,13 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                             continue;
                         }
                         CaptureMode::H264 => {
+                            // Fall back to BGRA if the client doesn't support AVC420.
+                            if !self.avc420_enabled.load(Ordering::Relaxed) {
+                                if let Some(update) = self.handle_bgra_frame(pixel_buf)? {
+                                    return Ok(Some(update));
+                                }
+                                continue;
+                            }
                             if let Some(update) = self.handle_ycbcr_frame(pixel_buf)? {
                                 return Ok(Some(update));
                             }
@@ -575,11 +645,10 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                 }
                 CaptureSource::CGDisplay => {
                     // Rate-limit: we already waited for fps_interval tick above.
-                    match cg_capture::capture_display_bgra() {
-                        Some(frame) => {
-                            match self.mode {
-                                CaptureMode::Bgra => {
-                                    // Convert captured frame to Bytes for handle_bgra_data
+                    match self.mode {
+                        CaptureMode::Bgra => {
+                            match cg_capture::capture_display_bgra() {
+                                Some(frame) => {
                                     let raw = bytes::Bytes::copy_from_slice(&frame.data);
                                     if let Some(update) = self.handle_bgra_data(
                                         &raw,
@@ -591,25 +660,129 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                                     }
                                     continue;
                                 }
-                                CaptureMode::H264 => {
-                                    // H264 not supported with CGDisplay capture yet.
-                                    // Fall back to BGRA.
-                                    let raw = bytes::Bytes::copy_from_slice(&frame.data);
-                                    if let Some(update) = self.handle_bgra_data(
-                                        &raw,
-                                        frame.width,
-                                        frame.height,
-                                        frame.stride,
-                                    )? {
-                                        return Ok(Some(update));
-                                    }
+                                None => {
+                                    // capture failed — skip frame
                                     continue;
                                 }
                             }
                         }
-                        None => {
-                            // capture failed — skip frame
-                            continue;
+                        CaptureMode::H264 => {
+                            // Fall back to BGRA if the client doesn't support AVC420.
+                            if !self.avc420_enabled.load(Ordering::Relaxed) {
+                                match cg_capture::capture_display_bgra() {
+                                    Some(frame) => {
+                                        let raw = bytes::Bytes::copy_from_slice(&frame.data);
+                                        if let Some(update) = self.handle_bgra_data(
+                                            &raw,
+                                            frame.width,
+                                            frame.height,
+                                            frame.stride,
+                                        )? {
+                                            return Ok(Some(update));
+                                        }
+                                        continue;
+                                    }
+                                    None => {
+                                        continue;
+                                    }
+                                }
+                            }
+                            // H264 encoding via CGDisplay capture:
+                            // Capture screen into CVPixelBuffer (BGRA),
+                            // then encode with VideoToolbox.
+                            match cg_capture::capture_display_as_cv_pixel_buffer() {
+                                Some(cv_buffer) => {
+                                    debug!("H264 CGDisplay: captured CVPixelBuffer {}×{}",
+                                           cv_buffer.width(), cv_buffer.height());
+                                    if let Some(encoder) = self.h264_encoder.as_mut() {
+                                        // Recreate the encoder if forced keyframe is requested.
+                                        // VTSessionSetProperty(ForceKeyFrame) is not supported
+                                        // (returns -12900), so we recreate the session instead.
+                                        // A new session always produces a keyframe first.
+                                        if self.force_keyframe.load(Ordering::Relaxed) {
+                                            debug!("Recreating H.264 encoder for forced keyframe");
+                                            let width = encoder.width();
+                                            let height = encoder.height();
+                                            match VtH264Encoder::new(width, height) {
+                                                Ok(new_encoder) => {
+                                                    self.h264_encoder = Some(new_encoder);
+                                                }
+                                                Err(e) => {
+                                                    warn!("Failed to recreate H.264 encoder: {e}, using existing");
+                                                }
+                                            }
+                                            self.force_keyframe.store(false, Ordering::Relaxed);
+                                        }
+                                        // Re-borrow after possible replacement.
+                                        let encoder = self.h264_encoder.as_mut().unwrap();
+                                        match encoder.encode(cv_buffer.as_ptr()) {
+                                            Ok(Some(H264Frame {
+                                                data,
+                                                is_keyframe,
+                                                width,
+                                                height,
+                                                ..
+                                            })) => {
+                                                return Ok(Some(DisplayUpdate::Avc420(Avc420Update {
+                                                    data,
+                                                    width,
+                                                    height,
+                                                    is_keyframe,
+                                                })));
+                                            }
+                                            Ok(None) => {
+                                                debug!("H264 CGDisplay encode produced no output");
+                                                continue;
+                                            }
+                                            Err(e) => {
+                                                warn!("H264 CGDisplay encode error: {e}, falling back to BGRA");
+                                                // Encode failed — fall back to BGRA for this frame
+                                                if let Some(frame) = cg_capture::capture_display_bgra() {
+                                                    let raw = bytes::Bytes::copy_from_slice(&frame.data);
+                                                    if let Some(update) = self.handle_bgra_data(
+                                                        &raw,
+                                                        frame.width,
+                                                        frame.height,
+                                                        frame.stride,
+                                                    )? {
+                                                        return Ok(Some(update));
+                                                    }
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                    } else {
+                                        // No encoder available, fall back to BGRA
+                                        if let Some(frame) = cg_capture::capture_display_bgra() {
+                                            let raw = bytes::Bytes::copy_from_slice(&frame.data);
+                                            if let Some(update) = self.handle_bgra_data(
+                                                &raw,
+                                                frame.width,
+                                                frame.height,
+                                                frame.stride,
+                                            )? {
+                                                return Ok(Some(update));
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                }
+                                None => {
+                                    // CVPixelBuffer capture failed, fall back to BGRA
+                                    if let Some(frame) = cg_capture::capture_display_bgra() {
+                                        let raw = bytes::Bytes::copy_from_slice(&frame.data);
+                                        if let Some(update) = self.handle_bgra_data(
+                                            &raw,
+                                            frame.width,
+                                            frame.height,
+                                            frame.stride,
+                                        )? {
+                                            return Ok(Some(update));
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
                         }
                     }
                 }
@@ -885,6 +1058,27 @@ impl MacDisplayUpdates {
             debug!("H264 encoder not available, skipping YCbCr frame");
             return Ok(None);
         };
+
+        // Recreate the encoder if forced keyframe is requested.
+        // VTSessionSetProperty(ForceKeyFrame) is not supported
+        // (returns -12900), so we recreate the session instead.
+        // A new session always produces a keyframe first.
+        if self.force_keyframe.load(Ordering::Relaxed) {
+            debug!("Recreating H.264 encoder for forced keyframe (SCKit path)");
+            let width = encoder.width();
+            let height = encoder.height();
+            match VtH264Encoder::new(width, height) {
+                Ok(new_encoder) => {
+                    self.h264_encoder = Some(new_encoder);
+                }
+                Err(e) => {
+                    warn!("Failed to recreate H.264 encoder: {e}, using existing");
+                }
+            }
+            self.force_keyframe.store(false, Ordering::Relaxed);
+        }
+        // Re-borrow after possible replacement.
+        let encoder = self.h264_encoder.as_mut().unwrap();
 
         // Lock the pixel buffer before encoding. VideoToolbox reads the buffer
         // asynchronously — without the lock, SCKit may overwrite it mid-encode.

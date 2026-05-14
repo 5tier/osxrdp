@@ -61,8 +61,14 @@ Three layers ensure this:
 
 CGDisplay capture works by:
 1. Polling `CGDisplay::image()` at the target FPS (30fps)
-2. Drawing the `CGImage` into a BGRA bitmap context
-3. Converting to `Bytes` and feeding through `handle_bgra_data`
+2. Drawing the `CGImage` into a bitmap context
+
+**BGRA mode**: draws into a BGRA bitmap context, converts to `Bytes`, feeds
+through `handle_bgra_data` for dirty-rect detection.
+
+**H.264 mode**: draws into a CVPixelBuffer (BGRA format), then encodes with
+VideoToolbox `VTCompressionSessionEncodeFrame`. Falls back to BGRA if
+encoding fails or the CVPixelBuffer cannot be created.
 
 ## Mode Switching Flow
 
@@ -83,12 +89,13 @@ CGDisplay capture works by:
 - `src/display.rs` — Display update stream. `CaptureSource` enum selects
   SCKit or CGDisplay. `request_layout()` triggers mode switch via child.
 - `src/cg_capture.rs` — CoreGraphics screen capture via
-  `CGDisplayCreateImage`. Produces BGRA frames for dirty-rect pipeline.
+  `CGDisplayCreateImage`. Produces BGRA frames for dirty-rect pipeline
+  and CVPixelBuffer frames for H.264 encoding.
 - `src/display_mode.rs` — `DisplayModeSwitcher` struct; parent process
   uses `CGDisplay::pixels_wide/high` only; spawns child for mode APIs;
   `--display-mode-switch` / `--display-mode-restore` CLI helpers;
   crash recovery via `/tmp/osxrdp_pending_restore`
-- `src/h264.rs` — VideoToolbox H.264 encoder (only for SCKit capture)
+- `src/h264.rs` — VideoToolbox H.264 encoder (used by SCKit and CGDisplay capture)
 - `src/input.rs` / `src/keyboard.rs` — macOS input event injection
 - `src/main.rs` — entry point, CLI arg dispatch for display mode helpers
 

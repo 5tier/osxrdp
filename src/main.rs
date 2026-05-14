@@ -111,6 +111,18 @@ async fn main() -> Result<()> {
     let mut mac_display = display::MacDisplay::with_mode(mode);
     let init_size = mac_display.size().await;
 
+    // Get the shared force_keyframe flag before moving mac_display into the server.
+    // When the GFX pipeline needs a keyframe (e.g. after surface creation),
+    // it sets this flag, and the H.264 encoder checks it before each encode call.
+    let force_keyframe = mac_display.force_keyframe_flag();
+
+    // Shared flag for AVC420 support. Starts optimistically as `true`.
+    // The GfxServer sets it to `false` during capability negotiation when
+    // the client advertises AVC_DISABLED. The display module checks it
+    // each frame and falls back to BGRA bitmap updates if false.
+    let avc420_enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    mac_display.set_avc420_flag(avc420_enabled.clone());
+
     let mut server = RdpServer::builder()
         .with_addr(addr.parse::<std::net::SocketAddr>()?)
         .with_tls(tls_acceptor)
@@ -118,10 +130,13 @@ async fn main() -> Result<()> {
         .with_display_handler(mac_display)
         .build();
 
-    // If H.264 mode is enabled, create a shared GfxServer for the RDPGFX pipeline
+    // If H.264 mode is enabled, create a shared GfxServer for the RDPGFX pipeline.
+    // Also link the force_keyframe flag so the GFX pipeline can signal the encoder.
     if h264 {
         let gfx = GfxServer::shared(init_size.width, init_size.height);
+        gfx.lock().unwrap().set_avc420_flag(avc420_enabled);
         server.set_gfx_server(gfx);
+        server.set_force_keyframe(force_keyframe);
         info!("RDPGFX H.264 pipeline enabled (OSXRDP_H264=0 to disable)");
     }
 
