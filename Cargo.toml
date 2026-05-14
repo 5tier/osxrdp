@@ -11,6 +11,10 @@ path = "src/main.rs"
 [dependencies]
 # RDP protocol — handles negotiation, encoding, session loop
 ironrdp-server = "0.10"
+# Clipboard virtual channel (CLIPRDR) PDUs and backend trait
+ironrdp-cliprdr = "0.5"
+# AsAny trait required by CliprdrBackend
+ironrdp-core = "0.1"
 # DisplayControl virtual channel PDUs (MonitorLayoutEntry, resize)
 ironrdp-displaycontrol = "0.5"
 # Diff algorithm for dirty-region detection (find_different_rects_sub)

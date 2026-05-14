@@ -1,5 +1,6 @@
 mod auth;
 mod cg_capture;
+mod clipboard;
 mod display;
 mod display_mode;
 mod h264;
@@ -13,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use display::CaptureMode;
-use ironrdp_server::{GfxServer, RdpServer, RdpServerDisplay};
+use ironrdp_server::{GfxServer, RdpServer, RdpServerDisplay, ServerEvent};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -128,6 +129,7 @@ async fn main() -> Result<()> {
         .with_tls(tls_acceptor)
         .with_input_handler(input::MacInputHandler::new())
         .with_display_handler(mac_display)
+        .with_cliprdr_factory(Some(Box::new(clipboard::MacClipboardFactory::new())))
         .build();
 
     // If H.264 mode is enabled, create a shared GfxServer for the RDPGFX pipeline.
@@ -146,10 +148,19 @@ async fn main() -> Result<()> {
         auth::verify_user_password(username, password)
     }));
 
-    // Run the server. When the display stream ends (client disconnects),
-    // MacDisplayUpdates::drop() restores the display mode via a child process.
-    // On crash, the pending-restore file + restore_pending() handle recovery.
-    // On Ctrl-C, tokio drops all tasks and the drop handlers run.
+    // Spawn a task that catches SIGINT/SIGTERM and sends a clean quit event
+    // so the server loop exits gracefully (drop handlers run, mode is restored).
+    let ev_sender = server.event_sender().clone();
+    tokio::spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => info!("SIGINT received, shutting down"),
+            _ = sigterm.recv() => info!("SIGTERM received, shutting down"),
+        }
+        let _ = ev_sender.send(ServerEvent::Quit("signal".into()));
+    });
+
     let result = server.run().await;
 
     // Give the restore child process time to complete before exiting.

@@ -19,7 +19,7 @@
     (`OSXRDP_ASPECT=fit` default, `native` for old behaviour)
 - [x] **T11** Permission UX: check Screen Recording + Accessibility at startup, print actionable instructions if missing
 - [~] **T12** CLI flags: `--addr`, `--cert`, `--key`, `--width`, `--height` via `clap` (env vars `OSXRDP_ADDR`, `OSXRDP_USER`, `OSXRDP_PASSWORD` working; clap flags TBD)
-- [ ] **T13** Graceful shutdown: catch SIGTERM/SIGINT, call `RdpServer` quit event
+- [x] **T13** Graceful shutdown: catch SIGTERM/SIGINT, call `RdpServer` quit event
 
 ## Phase 3: Performance
 
@@ -29,7 +29,7 @@
 
 ## Phase 4: Features
 
-- [ ] **T17** Clipboard redirection (`RDPCLIP` virtual channel via `ironrdp-cliprdr`)
+- [x] **T17** Clipboard redirection (`RDPCLIP` virtual channel via `ironrdp-cliprdr`)
 - [ ] **T18** Audio redirection (`RDPSND` via `ironrdp-rdpsnd` + CoreAudio tap)
 - [ ] **T19** NLA / CredSSP authentication (`RdpServerSecurity::Hybrid` + `sspi-rs`)
 - [ ] **T20** launchd plist: run as a background agent on login

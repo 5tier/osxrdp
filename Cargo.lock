@@ -1952,6 +1952,8 @@ dependencies = [
  "async-trait",
  "bytes",
  "core-graphics",
+ "ironrdp-cliprdr",
+ "ironrdp-core",
  "ironrdp-displaycontrol",
  "ironrdp-graphics",
  "ironrdp-server",
