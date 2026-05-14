@@ -15,6 +15,8 @@
 
 - [x] **T9**  Dirty-region diffing: only send changed tiles (`find_different_rects_sub` + `BitmapUpdate::sub`)
 - [x] **T10** Display resize: handle `DisplayUpdate::Resize` from `request_layout`
+- [x] **T10b** Aspect ratio: switch physical display to match client ratio, with crop+scale fallback
+    (`OSXRDP_ASPECT=fit` default, `native` for old behaviour)
 - [x] **T11** Permission UX: check Screen Recording + Accessibility at startup, print actionable instructions if missing
 - [~] **T12** CLI flags: `--addr`, `--cert`, `--key`, `--width`, `--height` via `clap` (env vars `OSXRDP_ADDR`, `OSXRDP_USER`, `OSXRDP_PASSWORD` working; clap flags TBD)
 - [ ] **T13** Graceful shutdown: catch SIGTERM/SIGINT, call `RdpServer` quit event

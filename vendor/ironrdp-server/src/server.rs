@@ -23,6 +23,42 @@ use ironrdp_tokio::{split_tokio_framed, unsplit_tokio_framed, FramedRead, Framed
 use rdpsnd::server::{RdpsndServer, RdpsndServerMessage};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
+
+/// Set TCP keepalive on a TCP stream so the server detects client disconnects.
+/// Without keepalive, a dropped RDP client can leave the server running
+/// indefinitely at the switched display resolution.
+fn set_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let on: libc::c_int = 1;
+    let idle: libc::c_int = 15; // seconds before first probe
+    let interval: libc::c_int = 5; // seconds between probes
+    let count: libc::c_int = 3; // number of failed probes before disconnect
+
+    unsafe {
+        // SO_KEEPALIVE
+        let ret = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, &on as *const _ as *const libc::c_void, size_of_val(&on) as libc::socklen_t);
+        if ret < 0 { return Err(std::io::Error::last_os_error()); }
+
+        // TCP_KEEPALIVE (macOS) / TCP_KEEPIDLE (Linux)
+        #[cfg(target_os = "macos")]
+        let idle_opt = libc::TCP_KEEPALIVE;
+        #[cfg(not(target_os = "macos"))]
+        let idle_opt = libc::TCP_KEEPIDLE;
+        let ret = libc::setsockopt(fd, libc::IPPROTO_TCP, idle_opt, &idle as *const _ as *const libc::c_void, size_of_val(&idle) as libc::socklen_t);
+        if ret < 0 { return Err(std::io::Error::last_os_error()); }
+
+        // TCP_KEEPINTVL
+        let ret = libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, &interval as *const _ as *const libc::c_void, size_of_val(&interval) as libc::socklen_t);
+        if ret < 0 { return Err(std::io::Error::last_os_error()); }
+
+        // TCP_KEEPCNT
+        let ret = libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, &count as *const _ as *const libc::c_void, size_of_val(&count) as libc::socklen_t);
+        if ret < 0 { return Err(std::io::Error::last_os_error()); }
+    }
+
+    Ok(())
+}
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task;
 use tokio_rustls::TlsAcceptor;
@@ -422,6 +458,12 @@ impl RdpServer {
                 },
                 Ok((stream, peer)) = listener.accept() => {
                     debug!(?peer, "Received connection");
+                    // Enable TCP keepalive so the server detects client disconnects
+                    // (especially important for RDP clients that close without
+                    // sending a disconnect PDU).
+                    if let Err(e) = set_tcp_keepalive(&stream) {
+                        warn!("Failed to set TCP keepalive: {e}");
+                    }
                     drop(ev_receiver);
                     if let Err(error) = self.run_connection(stream).await {
                         error!(?error, "Connection error");

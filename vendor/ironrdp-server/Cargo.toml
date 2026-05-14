@@ -35,6 +35,7 @@ ironrdp-acceptor = { path = "../ironrdp-acceptor", version = "0.8" }
 ironrdp-graphics = "0.7"
 ironrdp-rdpsnd = "0.7"
 tracing = { version = "0.1", features = ["log"] }
+libc = "0.2"
 x509-cert = { version = "0.2.5", optional = true }
 rustls-pemfile = { version = "2.2.0", optional = true }
 rayon = { version = "1.10.0", optional = true }

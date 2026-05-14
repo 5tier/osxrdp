@@ -64,19 +64,23 @@ Phase 1–3 (T1–T11, T14–T15) implemented. End-to-end tested with FreeRDP; r
 
 ```
 src/
-├── main.rs        RdpServerBuilder wiring — TLS + display + input + H.264 mode
-├── auth.rs        macOS system account authentication via dscl / opendirectoryd
-├── tls.rs         Self-signed TLS cert (rcgen + rustls 0.23)
-├── display.rs     MacDisplay / MacDisplayUpdates
-│                    AsyncSCStream → BitmapUpdate  (BGRA fallback)
-│                    AsyncSCStream → VtH264Encoder → Avc420Update  (H.264 mode)
-│                    Dirty-region diffing via ironrdp-graphics
-├── h264.rs        VideoToolbox H.264 encoder (raw macOS FFI)
-│                    CVPixelBuffer (NV12) → AVCC-format H.264 NAL units
-├── input.rs       MacInputHandler
-│                    KeyboardEvent → CGEventPost
-│                    MouseEvent → CGEventPost
-└── keyboard.rs    Windows scancode set-1 → macOS CGKeyCode table
+├── main.rs            RdpServerBuilder wiring — TLS + display + input + H.264 mode
+├── auth.rs            macOS system account authentication via dscl / opendirectoryd
+├── display.rs         MacDisplay / MacDisplayUpdates
+│                        AsyncSCStream → BitmapUpdate  (BGRA fallback)
+│                        AsyncSCStream → VtH264Encoder → Avc420Update  (H.264 mode)
+│                        DisplayModeSwitcher — switches physical display to match client
+│                        Crop+scale fallback when no matching display mode
+│                        Dirty-region diffing via ironrdp-graphics
+├── display_mode.rs     macOS display mode switching (CGDisplay APIs)
+├── tls.rs             Self-signed TLS cert (rcgen + rustls 0.23)
+├── h264.rs            VideoToolbox H.264 encoder (raw macOS FFI)
+│                        CVPixelBuffer (NV12) → AVCC-format H.264 NAL units
+├── input.rs           MacInputHandler
+│                        KeyboardEvent → CGEventPost
+│                        MouseEvent → CGEventPost
+├── keyboard.rs        Windows scancode set-1 → macOS CGKeyCode table
+└── permissions.rs     Screen Recording permission check at startup
 ```
 
 ### Vendored libraries
@@ -269,7 +273,8 @@ osxrdp.app/Contents/MacOS/osxrdp
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OSXRDP_ADDR` | `0.0.0.0:3389` | Listen address and port |
-| `OSXRDP_H264` | `1` | Enable H.264 VideoToolbox encoding (`0` = BGRA fallback) |
+| `OSXRDP_H264` | `0` | Enable H.264 VideoToolbox encoding (`1` = H.264, `0` = BGRA fallback) |
+| `OSXRDP_ASPECT` | `fit` | Aspect ratio: `fit` center-crop to fill client (no black bars), `native` preserve server ratio (may have black bars) |
 
 ### Connecting
 
