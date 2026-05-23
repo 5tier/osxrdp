@@ -2,20 +2,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use bytes::Bytes;
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
-use ironrdp_graphics::diff::find_different_rects_sub;
 use ironrdp_server::{
-    Avc420Update, BitmapUpdate, DesktopSize, DisplayUpdate, PixelFormat, RdpServerDisplay,
-    RdpServerDisplayUpdates,
+    Avc420Update, DesktopSize, DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates,
 };
 use screencapturekit::async_api::{AsyncSCShareableContent, AsyncSCStream};
 use screencapturekit::cv::CVPixelBufferLockFlags;
 use screencapturekit::prelude::{
     PixelFormat as SckPixelFormat, SCContentFilter, SCStreamConfiguration, SCStreamOutputType,
 };
-use std::collections::VecDeque;
-use std::num::{NonZeroU16, NonZeroUsize};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time;
@@ -23,6 +18,8 @@ use tokio::time;
 #[allow(unused_imports)]
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
+
+use crate::frame_pipeline::BgraFramePipeline;
 
 use crate::cg_capture;
 use crate::display_mode::DisplayModeSwitcher;
@@ -420,13 +417,6 @@ enum CaptureSource {
 
 // ─── Display update stream ───────────────────────────────────────────────────
 
-struct PrevFrame {
-    data: Bytes,
-    stride: usize,
-    width: usize,
-    height: usize,
-}
-
 pub struct MacDisplayUpdates {
     /// The capture backend (SCKit or CGDisplay).
     capture: CaptureSource,
@@ -436,11 +426,8 @@ pub struct MacDisplayUpdates {
     /// In Fit mode: the client's requested dimensions.
     /// In Native mode: the aspect-ratio-adjusted dimensions.
     target_size: DesktopSize,
-    /// How to handle aspect ratio mismatch.
-    aspect_mode: AspectMode,
     mode: CaptureMode,
-    prev: Option<PrevFrame>,
-    pending: VecDeque<BitmapUpdate>,
+    bgra_pipeline: BgraFramePipeline,
     resize_rx: watch::Receiver<Option<DesktopSize>>,
     /// VideoToolbox H.264 encoder (only for H264 mode).
     h264_encoder: Option<VtH264Encoder>,
@@ -503,10 +490,8 @@ impl MacDisplayUpdates {
             capture,
             stream_size: DesktopSize { width, height },
             target_size,
-            aspect_mode,
             mode,
-            prev: None,
-            pending: VecDeque::new(),
+            bgra_pipeline: BgraFramePipeline::new(target_size, aspect_mode),
             resize_rx,
             h264_encoder,
             fps_interval,
@@ -558,6 +543,7 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                         self.target_size.width, self.target_size.height,
                     );
                     self.target_size = size;
+                    self.bgra_pipeline.set_target(size);
                     if self.mode == CaptureMode::Bgra || !self.avc420_enabled.load(Ordering::Relaxed) {
                         return Ok(Some(DisplayUpdate::Resize(size)));
                     }
@@ -568,14 +554,14 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
             }
 
             // ── 2. Drain buffered sub-region updates (BGRA mode) ──────────────
-            if let Some(update) = self.pending.pop_front() {
-                return Ok(Some(DisplayUpdate::Bitmap(update)));
+            if let Some(update) = self.bgra_pipeline.pop_update() {
+                return Ok(Some(update));
             }
 
             // ── 3. Rate-limit: wait until the next frame slot ─────────────────
             self.fps_interval.tick().await;
 
-            // ── 4. Capture the next frame ──────────────────────────────────────────
+            // ── 4. Capture the next frame ──────────────────────────────────────
             match &mut self.capture {
                 CaptureSource::Sckit(stream) => {
                     let Some(sample) = stream.next().await else {
@@ -623,7 +609,14 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 
                     match self.mode {
                         CaptureMode::Bgra => {
-                            if let Some(update) = self.handle_bgra_frame(pixel_buf)? {
+                            let guard = pixel_buf
+                                .lock(CVPixelBufferLockFlags::READ_ONLY)
+                                .map_err(|code| anyhow!("CVPixelBuffer lock failed: {code}"))?;
+                            let (src_w, src_h, src_stride) =
+                                (guard.width(), guard.height(), guard.bytes_per_row());
+                            self.bgra_pipeline.push_frame(guard.as_slice(), src_w, src_h, src_stride);
+                            drop(guard);
+                            if let Some(update) = self.bgra_pipeline.pop_update() {
                                 return Ok(Some(update));
                             }
                             continue;
@@ -631,7 +624,14 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                         CaptureMode::H264 => {
                             // Fall back to BGRA if the client doesn't support AVC420.
                             if !self.avc420_enabled.load(Ordering::Relaxed) {
-                                if let Some(update) = self.handle_bgra_frame(pixel_buf)? {
+                                let guard = pixel_buf
+                                    .lock(CVPixelBufferLockFlags::READ_ONLY)
+                                    .map_err(|code| anyhow!("CVPixelBuffer lock failed: {code}"))?;
+                                let (src_w, src_h, src_stride) =
+                                    (guard.width(), guard.height(), guard.bytes_per_row());
+                                self.bgra_pipeline.push_frame(guard.as_slice(), src_w, src_h, src_stride);
+                                drop(guard);
+                                if let Some(update) = self.bgra_pipeline.pop_update() {
                                     return Ok(Some(update));
                                 }
                                 continue;
@@ -644,48 +644,30 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                     }
                 }
                 CaptureSource::CGDisplay => {
-                    // Rate-limit: we already waited for fps_interval tick above.
                     match self.mode {
                         CaptureMode::Bgra => {
-                            match cg_capture::capture_display_bgra() {
-                                Some(frame) => {
-                                    let raw = bytes::Bytes::copy_from_slice(&frame.data);
-                                    if let Some(update) = self.handle_bgra_data(
-                                        &raw,
-                                        frame.width,
-                                        frame.height,
-                                        frame.stride,
-                                    )? {
-                                        return Ok(Some(update));
-                                    }
-                                    continue;
-                                }
-                                None => {
-                                    // capture failed — skip frame
-                                    continue;
+                            if let Some(frame) = cg_capture::capture_display_bgra() {
+                                self.bgra_pipeline.push_frame(
+                                    &frame.data, frame.width, frame.height, frame.stride,
+                                );
+                                if let Some(update) = self.bgra_pipeline.pop_update() {
+                                    return Ok(Some(update));
                                 }
                             }
+                            continue;
                         }
                         CaptureMode::H264 => {
                             // Fall back to BGRA if the client doesn't support AVC420.
                             if !self.avc420_enabled.load(Ordering::Relaxed) {
-                                match cg_capture::capture_display_bgra() {
-                                    Some(frame) => {
-                                        let raw = bytes::Bytes::copy_from_slice(&frame.data);
-                                        if let Some(update) = self.handle_bgra_data(
-                                            &raw,
-                                            frame.width,
-                                            frame.height,
-                                            frame.stride,
-                                        )? {
-                                            return Ok(Some(update));
-                                        }
-                                        continue;
-                                    }
-                                    None => {
-                                        continue;
+                                if let Some(frame) = cg_capture::capture_display_bgra() {
+                                    self.bgra_pipeline.push_frame(
+                                        &frame.data, frame.width, frame.height, frame.stride,
+                                    );
+                                    if let Some(update) = self.bgra_pipeline.pop_update() {
+                                        return Ok(Some(update));
                                     }
                                 }
+                                continue;
                             }
                             // H264 encoding via CGDisplay capture:
                             // Capture screen into CVPixelBuffer (BGRA),
@@ -736,15 +718,11 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                                             }
                                             Err(e) => {
                                                 warn!("H264 CGDisplay encode error: {e}, falling back to BGRA");
-                                                // Encode failed — fall back to BGRA for this frame
                                                 if let Some(frame) = cg_capture::capture_display_bgra() {
-                                                    let raw = bytes::Bytes::copy_from_slice(&frame.data);
-                                                    if let Some(update) = self.handle_bgra_data(
-                                                        &raw,
-                                                        frame.width,
-                                                        frame.height,
-                                                        frame.stride,
-                                                    )? {
+                                                    self.bgra_pipeline.push_frame(
+                                                        &frame.data, frame.width, frame.height, frame.stride,
+                                                    );
+                                                    if let Some(update) = self.bgra_pipeline.pop_update() {
                                                         return Ok(Some(update));
                                                     }
                                                 }
@@ -752,15 +730,12 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                                             }
                                         }
                                     } else {
-                                        // No encoder available, fall back to BGRA
+                                        // No encoder available, fall back to BGRA.
                                         if let Some(frame) = cg_capture::capture_display_bgra() {
-                                            let raw = bytes::Bytes::copy_from_slice(&frame.data);
-                                            if let Some(update) = self.handle_bgra_data(
-                                                &raw,
-                                                frame.width,
-                                                frame.height,
-                                                frame.stride,
-                                            )? {
+                                            self.bgra_pipeline.push_frame(
+                                                &frame.data, frame.width, frame.height, frame.stride,
+                                            );
+                                            if let Some(update) = self.bgra_pipeline.pop_update() {
                                                 return Ok(Some(update));
                                             }
                                         }
@@ -768,15 +743,12 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                                     }
                                 }
                                 None => {
-                                    // CVPixelBuffer capture failed, fall back to BGRA
+                                    // CVPixelBuffer capture failed, fall back to BGRA.
                                     if let Some(frame) = cg_capture::capture_display_bgra() {
-                                        let raw = bytes::Bytes::copy_from_slice(&frame.data);
-                                        if let Some(update) = self.handle_bgra_data(
-                                            &raw,
-                                            frame.width,
-                                            frame.height,
-                                            frame.stride,
-                                        )? {
+                                        self.bgra_pipeline.push_frame(
+                                            &frame.data, frame.width, frame.height, frame.stride,
+                                        );
+                                        if let Some(update) = self.bgra_pipeline.pop_update() {
                                             return Ok(Some(update));
                                         }
                                     }
@@ -792,111 +764,6 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 }
 
 impl MacDisplayUpdates {
-    /// Handle BGRA pixel data from CGDisplay capture.
-    /// Returns `Some(DisplayUpdate)` when there's something to send,
-    /// or `None` if the frame was identical to the previous one.
-    fn handle_bgra_data(
-        &mut self,
-        raw_data: &Bytes,
-        src_w: usize,
-        src_h: usize,
-        src_stride: usize,
-    ) -> Result<Option<DisplayUpdate>> {
-        // Apply letterbox-scale if in Fit mode (dimensions differ from target).
-        let (data, w, h, stride) = if self.needs_crop_scale(src_w, src_h) {
-            self.letterbox_bgra(raw_data, src_w, src_h, src_stride)
-        } else {
-            (raw_data.clone(), src_w, src_h, src_stride)
-        };
-
-        let new_bitmap = make_bitmap(data.clone(), w, h, stride)?;
-
-        // First frame or resolution change → full refresh
-        let prev = match &self.prev {
-            None => {
-                debug!("First CGDisplay frame at {}×{} (full refresh)", w, h);
-                self.prev = Some(PrevFrame {
-                    data,
-                    stride,
-                    width: w,
-                    height: h,
-                });
-                return Ok(Some(DisplayUpdate::Bitmap(new_bitmap)));
-            }
-            Some(p) if p.width != w || p.height != h => {
-                debug!(
-                    "Resolution change detected: {}×{} → {}×{} (full refresh)",
-                    p.width, p.height, w, h
-                );
-                self.prev = Some(PrevFrame {
-                    data,
-                    stride,
-                    width: w,
-                    height: h,
-                });
-                return Ok(Some(DisplayUpdate::Bitmap(new_bitmap)));
-            }
-            Some(p) => p,
-        };
-
-        // Compute dirty rectangles
-        let diffs = find_different_rects_sub::<4>(
-            &prev.data,
-            prev.stride,
-            prev.width,
-            prev.height,
-            &data,
-            stride,
-            w,
-            h,
-            0,
-            0,
-        );
-
-        self.prev = Some(PrevFrame {
-            data,
-            stride,
-            width: w,
-            height: h,
-        });
-
-        if diffs.is_empty() {
-            return Ok(None);
-        }
-
-        debug!("{} dirty rect(s) this frame", diffs.len());
-
-        // Fast path: large change → send full frame
-        let total_dirty: u64 = diffs
-            .iter()
-            .map(|r| r.width as u64 * r.height as u64)
-            .sum();
-        if total_dirty > (w as u64 * h as u64) / 2 {
-            return Ok(Some(DisplayUpdate::Bitmap(new_bitmap)));
-        }
-
-        // Carve out sub-region BitmapUpdates
-        let mut enqueued = 0usize;
-        for rect in &diffs {
-            let Some(rw) = NonZeroU16::new(rect.width as u16) else {
-                continue;
-            };
-            let Some(rh) = NonZeroU16::new(rect.height as u16) else {
-                continue;
-            };
-            if let Some(sub) = new_bitmap.sub(rect.x as u16, rect.y as u16, rw, rh) {
-                self.pending.push_back(sub);
-                enqueued += 1;
-            }
-        }
-
-        if enqueued == 0 {
-            return Ok(None);
-        }
-
-        Ok(None)
-    }
-
     /// Recreate the stream and encoder at a new resolution.
     /// Only meaningful for SCKit; CGDisplay adapts automatically.
     async fn recreate_stream(&mut self, new_width: u16, new_height: u16) -> Result<()> {
@@ -925,123 +792,8 @@ impl MacDisplayUpdates {
         if self.mode == CaptureMode::H264 {
             self.h264_encoder = Some(VtH264Encoder::new(new_width, new_height)?);
         }
-        self.prev = None;
-        self.pending.clear();
+        self.bgra_pipeline.reset();
         Ok(())
-    }
-
-    /// Handle a BGRA frame (the original path).
-    /// Returns `Some(DisplayUpdate)` when there's something to send,
-    /// or `None` if the frame was identical to the previous one.
-    fn handle_bgra_frame(
-        &mut self,
-        pixel_buf: screencapturekit::cv::CVPixelBuffer,
-    ) -> Result<Option<DisplayUpdate>> {
-        let guard = pixel_buf
-            .lock(CVPixelBufferLockFlags::READ_ONLY)
-            .map_err(|code| anyhow!("CVPixelBuffer lock failed: {code}"))?;
-
-        let src_w = guard.width();
-        let src_h = guard.height();
-        let src_stride = guard.bytes_per_row();
-        let raw_data = Bytes::copy_from_slice(guard.as_slice());
-        drop(guard);
-
-        // Apply letterbox-scale if in Fit mode (dimensions differ from target).
-        let (data, w, h, stride) = if self.needs_crop_scale(src_w, src_h) {
-            self.letterbox_bgra(&raw_data, src_w, src_h, src_stride)
-        } else {
-            (raw_data, src_w, src_h, src_stride)
-        };
-
-        let new_bitmap = make_bitmap(data.clone(), w, h, stride)?;
-
-        // First frame or resolution change → full refresh
-        let prev = match &self.prev {
-            None => {
-                debug!("First frame at {}×{} (full refresh)", w, h);
-                self.prev = Some(PrevFrame {
-                    data,
-                    stride,
-                    width: w,
-                    height: h,
-                });
-                return Ok(Some(DisplayUpdate::Bitmap(new_bitmap)));
-            }
-            Some(p) if p.width != w || p.height != h => {
-                debug!(
-                    "Resolution change detected: {}×{} → {}×{} (full refresh)",
-                    p.width, p.height, w, h
-                );
-                self.prev = Some(PrevFrame {
-                    data,
-                    stride,
-                    width: w,
-                    height: h,
-                });
-                return Ok(Some(DisplayUpdate::Bitmap(new_bitmap)));
-            }
-            Some(p) => p,
-        };
-
-        // Compute dirty rectangles (in target coordinates after crop+scale)
-        let diffs = find_different_rects_sub::<4>(
-            &prev.data,
-            prev.stride,
-            prev.width,
-            prev.height,
-            &data,
-            stride,
-            w,
-            h,
-            0,
-            0,
-        );
-
-        self.prev = Some(PrevFrame {
-            data,
-            stride,
-            width: w,
-            height: h,
-        });
-
-        if diffs.is_empty() {
-            return Ok(None); // No changes — skip this frame entirely
-        }
-
-        debug!("{} dirty rect(s) this frame", diffs.len());
-
-        // Fast path: large change → send full frame
-        let total_dirty: u64 = diffs
-            .iter()
-            .map(|r| r.width as u64 * r.height as u64)
-            .sum();
-        if total_dirty > (w as u64 * h as u64) / 2 {
-            return Ok(Some(DisplayUpdate::Bitmap(new_bitmap)));
-        }
-
-        // Carve out sub-region BitmapUpdates and queue them
-        let mut enqueued = 0usize;
-        for rect in &diffs {
-            let Some(rw) = NonZeroU16::new(rect.width as u16) else {
-                continue;
-            };
-            let Some(rh) = NonZeroU16::new(rect.height as u16) else {
-                continue;
-            };
-            if let Some(sub) = new_bitmap.sub(rect.x as u16, rect.y as u16, rw, rh) {
-                self.pending.push_back(sub);
-                enqueued += 1;
-            }
-        }
-
-        if enqueued == 0 {
-            return Ok(None);
-        }
-
-        // The first sub-region is returned from the pending queue on the
-        // next iteration of the loop (step 2).
-        Ok(None)
     }
 
     /// Handle a YCbCr 4:2:0 (NV12) frame from ScreenCaptureKit.
@@ -1116,108 +868,9 @@ impl MacDisplayUpdates {
         }
     }
 
-    /// Whether rescaling is needed for the current frame.
-    /// True when the frame dimensions differ from the target (client)
-    /// dimensions. In Fit mode we letterbox — scale the full source to
-    /// fit inside the target, adding black bars where aspect ratios differ.
-    fn needs_crop_scale(&self, frame_w: usize, frame_h: usize) -> bool {
-        if self.aspect_mode != AspectMode::Fit {
-            return false;
-        }
-        let target = self.target_size;
-        // Fast path: if frame already matches target, no processing needed
-        if frame_w == target.width as usize && frame_h == target.height as usize {
-            return false;
-        }
-        // Re-scale whenever dimensions differ
-        frame_w != target.width as usize || frame_h != target.height as usize
-    }
-
-    /// Letterbox-scale a BGRA frame to fit inside the target dimensions.
-    ///
-    /// The full source image is scaled to fit entirely within the target,
-    /// preserving the source aspect ratio. Black bars (opaque black, BGRA
-    /// 0x000000FF) fill any remaining space. No content is cropped or
-    /// discarded.
-    fn letterbox_bgra(
-        &self,
-        src: &[u8],
-        src_w: usize,
-        src_h: usize,
-        src_stride: usize,
-    ) -> (Bytes, usize, usize, usize) {
-        let target = self.target_size;
-        let dst_w = target.width as usize;
-        let dst_h = target.height as usize;
-
-        let (scaled_x, scaled_y, scaled_w, scaled_h) =
-            compute_letterbox_rect(src_w, src_h, dst_w, dst_h);
-
-        let dst_stride = dst_w * 4;
-        let mut dst = vec![0u8; dst_h * dst_stride];
-
-        // Fill entire buffer with opaque black (BGRA: 0,0,0,255)
-        for pixel in dst.chunks_exact_mut(4) {
-            pixel[0] = 0;   // B
-            pixel[1] = 0;   // G
-            pixel[2] = 0;   // R
-            pixel[3] = 255; // A
-        }
-
-        // Nearest-neighbour scaling from source to the letterbox region.
-        // Integer arithmetic avoids floating-point and is faster.
-        for dy in 0..scaled_h {
-            let src_y = dy * src_h / scaled_h;
-            let src_row_off = src_y * src_stride;
-            let dst_row_off = (scaled_y + dy) * dst_stride;
-            for dx in 0..scaled_w {
-                let src_x = dx * src_w / scaled_w;
-                let si = src_row_off + src_x * 4;
-                let di = dst_row_off + (scaled_x + dx) * 4;
-                dst[di..di + 4].copy_from_slice(&src[si..si + 4]);
-            }
-        }
-
-        (Bytes::from(dst), dst_w, dst_h, dst_stride)
-    }
 }
 
-// ─── Letterbox + scale helpers ──────────────────────────────────────────────
-
-/// Compute the position and size of the scaled source image within the
-/// target rectangle, preserving the source aspect ratio.
-///
-/// Returns `(x, y, w, h)` — the region of the target where the scaled
-/// source should be drawn. Black bars fill the remaining space.
-/// No content is cropped or discarded.
-fn compute_letterbox_rect(
-    src_w: usize,
-    src_h: usize,
-    dst_w: usize,
-    dst_h: usize,
-) -> (usize, usize, usize, usize) {
-    let src_ratio = src_w as f64 / src_h as f64;
-    let dst_ratio = dst_w as f64 / dst_h as f64;
-
-    if (src_ratio - dst_ratio).abs() < 0.001 {
-        // Same aspect ratio — scale directly, no letterbox needed.
-        (0, 0, dst_w, dst_h)
-    } else if src_ratio > dst_ratio {
-        // Source is wider → letterbox top/bottom, source fills full width.
-        let scaled_h = (dst_w as f64 / src_ratio).round() as usize;
-        let scaled_h = scaled_h & !1; // round to even
-        let y = (dst_h.saturating_sub(scaled_h)) / 2;
-        (0, y, dst_w, scaled_h)
-    } else {
-        // Source is taller → letterbox left/right, source fills full height.
-        let scaled_w = (dst_h as f64 * src_ratio).round() as usize;
-        let scaled_w = scaled_w & !1; // round to even
-        let x = (dst_w.saturating_sub(scaled_w)) / 2;
-        (x, 0, scaled_w, dst_h)
-    }
-}
-
-// ─── SCKit + bitmap helpers ─────────────────────────────────────────────────
+// ─── SCKit + size helpers ────────────────────────────────────────────────────
 
 /// Get the native display size using CGDisplay (not SCKit).
 ///
@@ -1349,14 +1002,3 @@ async fn create_stream_inner(
     Ok(stream)
 }
 
-fn make_bitmap(data: Bytes, w: usize, h: usize, stride: usize) -> Result<BitmapUpdate> {
-    Ok(BitmapUpdate {
-        x: 0,
-        y: 0,
-        width: NonZeroU16::new(w as u16).ok_or_else(|| anyhow!("zero width"))?,
-        height: NonZeroU16::new(h as u16).ok_or_else(|| anyhow!("zero height"))?,
-        format: PixelFormat::BgrA32,
-        data,
-        stride: NonZeroUsize::new(stride).ok_or_else(|| anyhow!("zero stride"))?,
-    })
-}

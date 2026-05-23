@@ -3,6 +3,7 @@ mod cg_capture;
 mod clipboard;
 mod display;
 mod display_mode;
+mod frame_pipeline;
 mod h264;
 mod input;
 mod keyboard;

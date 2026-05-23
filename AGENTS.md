@@ -1,109 +1,87 @@
-# Agents / AI Assistant Notes
+# AGENTS.md
 
-## Goal
+## Build & Test
 
-Make the Mac server's physical display adapt to the RDP client's display
-resolution and aspect ratio — **no black bars, no cropping, no
-letterboxing.** When a 16:10 client connects to a 21:9 ultrawide Mac, the
-Mac switches to a matching 16:10 resolution. When the client disconnects,
-the original resolution is restored.
+```sh
+cargo build              # debug
+cargo build --release    # release (LTO, 1 codegen unit)
+cargo test --release     # tests (only in CI; no src/ tests, only vendor crate tests)
+```
 
-## ⚠️ Hard Rule: Always Restore Original Resolution
+No clippy, rustfmt, or other linters are configured. CI runs `cargo build --release` + `cargo test --release` only.
 
-**The original display resolution MUST always be restored.** No matter
-what — client disconnect, osxrdp crash, SIGSEGV, force-kill, power
-failure — the Mac's display must return to its original resolution.
+## Hard Rules
 
-Three layers ensure this:
+**Always restore original display resolution.** Three layers enforce this — never remove any:
 
-1. **`DisplayModeSwitcher::restore()` on Drop** — called when osxrdp
-   exits cleanly (client disconnect, Ctrl-C). Restores via child process.
-2. **`/tmp/osxrdp_pending_restore` file** — written before the mode
-   switch, deleted after successful restore. If osxrdp crashes or is
-   killed, this file persists and is read on next startup by
-   `display_mode::restore_pending()`, which restores the original mode.
-3. **`CGConfigureOption::ConfigureForSession`** — the mode change persists
-   for the login session but reverts on logout/restart. If both the
-   restore and the pending file fail, logging out or restarting the Mac
-   will revert to the system default resolution.
+1. `DisplayModeSwitcher::restore()` on Drop (clean exit)
+2. `/tmp/osxrdp_pending_restore` file (crash recovery, read on next startup)
+3. `CGConfigureOption::ConfigureForSession` (session-scoped, reverts on logout)
 
-**Never remove, weaken, or bypass any of these three layers.**
+## macOS Bugs You Must Work Around
 
-## The SCKit and CoreGraphics Bugs
+1. **SCKit crashes after any display mode change** — use `CGDisplayCreateImage` (`CaptureSource::CGDisplay`) instead of ScreenCaptureKit after a mode switch.
 
-**macOS has two bugs that affect display mode switching:**
+2. **`CGDisplayMode::all_display_modes` and `CGDisplaySetDisplayMode` crash after a mode change** — ALL mode enumeration and switching runs in a **child process** (`osxrdp --display-mode-switch`). Parent only reads safe getters (`pixels_wide/pixels_high`).
 
-1. **SCKit crash**: `ScreenCaptureKit` crashes (SIGSEGV in
-   `createContentFilterWithDisplay`) after ANY display mode change, even
-   from a separate process. SCKit cannot be used after a mode change.
+If you need to add new CoreGraphics display APIs, check whether they crash post-mode-change and route them through the child process if so.
 
-2. **CoreGraphics crash**: `CGDisplayMode::all_display_modes` and
-   `CGDisplaySetDisplayMode` crash (SIGSEGV in `__os_lock_handoff_lock_slow`)
-   after a display mode change. Both APIs must be called in a child process.
+## Vendored Crates
 
-**Solutions:**
+`vendor/` contains locally patched ironrdp crates, wired via `[patch.crates-io]` in `Cargo.toml`:
 
-- **Screen capture**: When a mode switch has occurred, use
-  `CGDisplayCreateImage` instead of SCKit. The `CaptureSource` enum selects
-  `Sckit(AsyncSCStream)` or `CGDisplay` at stream creation time.
-- **Mode APIs**: ALL display mode APIs (`all_display_modes`,
-  `CGDisplaySetDisplayMode`, `display_mode()`) are called in a **child
-  process** (`osxrdp --display-mode-switch`). The parent only uses safe
-  read-only getters (`CGDisplay::pixels_wide/pixels_high`).
+| Crate | Why vendored |
+|-------|-------------|
+| `ironrdp-acceptor` | Domain-agnostic credential comparison |
+| `ironrdp-server` | H.264 AVC420 support + RDPGFX DVC channel |
+| `ironrdp-pdu-0.7.0` | GFX capability version handling |
 
-| Operation | Where it runs | Why |
-|-----------|--------------|-----|
-| Mode enumeration | Child process | `all_display_modes` crashes after mode change |
-| Mode switching | Child process | `CGDisplaySetDisplayMode` crashes after mode change |
-| Mode restore | Child process | Same crash risk |
-| Screen capture (no switch) | Parent process | SCKit works without mode change |
-| Screen capture (after switch) | Parent process | CGDisplay capture, SCKit crashes |
+When upgrading, re-apply local patches. Key modified files in `vendor/ironrdp-server/src/`: `display.rs`, `encoder/mod.rs`, `gfx.rs`, `lib.rs`, `server.rs`.
 
-CGDisplay capture works by:
-1. Polling `CGDisplay::image()` at the target FPS (30fps)
-2. Drawing the `CGImage` into a bitmap context
+## H.264 Is Disabled by Default
 
-**BGRA mode**: draws into a BGRA bitmap context, converts to `Bytes`, feeds
-through `handle_bgra_data` for dirty-rect detection.
+`OSXRDP_H264=0` (default). The GFX server doesn't handle dynamic resize properly (size mismatch between display stream and GFX surface). Use BGRA mode until fixed. Enable with `OSXRDP_H264=1`.
 
-**H.264 mode**: draws into a CVPixelBuffer (BGRA format), then encodes with
-VideoToolbox `VTCompressionSessionEncodeFrame`. Falls back to BGRA if
-encoding fails or the CVPixelBuffer cannot be created.
+## build.rs Gotcha
 
-## Mode Switching Flow
+Do **not** add the CLT swift-5.5 path (`/Library/Developer/CommandLineTools/usr/lib/swift-5.5/macosx`) to the rpath. It contains a real `.dylib` that conflicts with the system dyld cache version at `/usr/lib/swift`, causing "class implemented in both" ObjC warnings. The `build.rs` already handles this correctly.
 
-1. RDP client connects, sends display layout (e.g., 1470×919)
-2. `request_layout()` detects aspect mismatch → spawns child process
-   `osxrdp --display-mode-switch <id> <w> <h>`
-3. Child process enumerates modes, finds best match, switches via
-   `CGDisplaySetDisplayMode`, prints `OK <w> <h>` to stdout
-4. Parent reads child's stdout to get the actual switched resolution
-5. `request_layout()` sets `mode_switch_pending`
-6. `updates()` detects `mode_switch_pending` → 500ms delay → uses
-   `CaptureSource::CGDisplay` for screen capture
-7. On client disconnect → `DisplayModeSwitcher::restore()` → spawns
-   `osxrdp --display-mode-restore` child to revert original resolution
+## Source Map
 
-## Architecture
+| File | Purpose |
+|------|---------|
+| `src/main.rs` | Entry point, CLI dispatch for display mode helpers, server wiring |
+| `src/display.rs` | Screen capture stream, `CaptureSource` enum (SCKit vs CGDisplay), `request_layout()` triggers mode switch |
+| `src/frame_pipeline.rs` | `BgraFramePipeline` — letterbox, dirty-region detection, sub-region update queue for BGRA frames |
+| `src/display_mode.rs` | `DisplayModeSwitcher`, child process mode APIs, crash recovery |
+| `src/cg_capture.rs` | `CGDisplayCreateImage` capture, BGRA/H.264 frame production |
+| `src/h264.rs` | VideoToolbox H.264 encoder |
+| `src/input.rs` | Keyboard/mouse injection via `CGEventPost` |
+| `src/keyboard.rs` | Windows scancode → macOS CGKeyCode table |
+| `src/clipboard.rs` | Clipboard redirection via `ironrdp-cliprdr` |
+| `src/auth.rs` | macOS system account auth via `dscl`/opendirectoryd |
+| `src/permissions.rs` | Screen Recording permission check at startup |
+| `src/tls.rs` | Self-signed TLS cert (rcgen + rustls) |
 
-- `src/display.rs` — Display update stream. `CaptureSource` enum selects
-  SCKit or CGDisplay. `request_layout()` triggers mode switch via child.
-- `src/cg_capture.rs` — CoreGraphics screen capture via
-  `CGDisplayCreateImage`. Produces BGRA frames for dirty-rect pipeline
-  and CVPixelBuffer frames for H.264 encoding.
-- `src/display_mode.rs` — `DisplayModeSwitcher` struct; parent process
-  uses `CGDisplay::pixels_wide/high` only; spawns child for mode APIs;
-  `--display-mode-switch` / `--display-mode-restore` CLI helpers;
-  crash recovery via `/tmp/osxrdp_pending_restore`
-- `src/h264.rs` — VideoToolbox H.264 encoder (used by SCKit and CGDisplay capture)
-- `src/input.rs` / `src/keyboard.rs` — macOS input event injection
-- `src/main.rs` — entry point, CLI arg dispatch for display mode helpers
+## Environment Variables
 
-## Key Permissions
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `OSXRDP_ADDR` | `0.0.0.0:3389` | Listen address |
+| `OSXRDP_H264` | `0` | `1` enables VideoToolbox H.264 |
+| `OSXRDP_ASPECT` | `fit` | `fit` = switch display to match client (no black bars), `native` = keep server resolution (black bars if ratio differs) |
+| `RUST_LOG` | `osxrdp=info` | `trace` for per-frame diffs |
 
-osxrdp requires four macOS permissions:
+## Agent skills
 
-1. **Screen Recording** — System Settings → Privacy & Security
-2. **Accessibility** — System Settings → Privacy & Security
-3. **Network Incoming Connections** — firewall prompt on first run
-4. **SSH Remote Login** — for remote access to the Mac
+### Issue tracker
+
+Issues are tracked in GitHub Issues (`github.com/5tier/osxrdp`). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default label vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context layout — one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
