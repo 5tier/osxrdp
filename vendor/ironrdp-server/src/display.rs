@@ -313,6 +313,11 @@ pub trait RdpServerDisplay: Send {
     fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
         debug!(?layout, "Requesting layout")
     }
+
+    /// Called when the client connection has ended for good (disconnect or
+    /// connection error). NOT called on deactivation-reactivation, which only
+    /// recreates the update stream within the same connection.
+    fn client_disconnected(&mut self) {}
 }
 
 #[cfg(test)]

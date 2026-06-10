@@ -108,7 +108,8 @@ pub struct MacDisplay {
     /// How to handle aspect ratio mismatch between native display and client.
     aspect_mode: AspectMode,
     /// Switches the physical display to a resolution matching the client.
-    /// Moved into MacDisplayUpdates on stream creation, restored on drop.
+    /// Lives here for the whole server lifetime; restored to the original
+    /// mode in client_disconnected() when a connection ends.
     mode_switcher: Option<DisplayModeSwitcher>,
     /// When a mode switch was performed, we must wait for macOS to propagate
     /// the change before creating an SCKit stream. This field stores the
@@ -216,10 +217,11 @@ impl RdpServerDisplay for MacDisplay {
     }
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
-        // Take ownership of the mode switcher so it moves into MacDisplayUpdates.
-        // When the stream ends (client disconnects), MacDisplayUpdates::drop()
-        // will restore the original display mode.
-        let mode_switcher = self.mode_switcher.take();
+        // NOTE: the mode switcher stays in MacDisplay. The update stream is
+        // recreated on every deactivation-reactivation (e.g. resize), so tying
+        // the display-mode restore to the stream's Drop would undo a mode
+        // switch one second after it was made. Restore happens in
+        // client_disconnected() instead, when the connection truly ends.
 
         // Wait briefly for DisplayControl layout from the client.
         let mut polled: u32 = 0;
@@ -282,7 +284,6 @@ impl RdpServerDisplay for MacDisplay {
             self.target_fps,
             self.resize_rx.clone(),
             use_cgdisplay,
-            mode_switcher,
             Arc::clone(&self.force_keyframe),
             Arc::clone(&self.avc420_enabled),
         )
@@ -399,6 +400,23 @@ impl RdpServerDisplay for MacDisplay {
             let _ = self.resize_tx.send(Some(effective_size));
         }
     }
+
+    fn client_disconnected(&mut self) {
+        if let Some(ref mut switcher) = self.mode_switcher {
+            info!("Client disconnected, restoring original display mode");
+            if let Err(e) = switcher.restore() {
+                warn!("Failed to restore display mode on disconnect: {e}");
+            }
+        }
+        // Forget per-connection state so the next client negotiates from
+        // scratch. The desktop is back at native resolution; a stale
+        // current_size would make the server skip request_layout when the
+        // next client requests the same dimensions, and a stale native_size
+        // would reflect the previously switched mode.
+        self.current_size = None;
+        self.native_size = None;
+        self.mode_switch_pending = None;
+    }
 }
 
 // ─── Capture source ─────────────────────────────────────────────────────────
@@ -437,9 +455,6 @@ pub struct MacDisplayUpdates {
     /// the stream is running. Track consecutive failures to detect this.
     missed_frames: u32,
     target_fps: u32,
-    /// Display mode switcher. When the stream ends (client disconnects),
-    /// the Drop impl restores the original display mode via child process.
-    mode_switcher: Option<DisplayModeSwitcher>,
     /// Shared flag to signal the H.264 encoder that a keyframe is needed.
     /// Set by server.rs when GfxServer::needs_keyframe() is true,
     /// checked by the encoder before each encode call.
@@ -461,7 +476,6 @@ impl MacDisplayUpdates {
         target_fps: u32,
         resize_rx: watch::Receiver<Option<DesktopSize>>,
         use_cgdisplay: bool,
-        mode_switcher: Option<DisplayModeSwitcher>,
         force_keyframe: Arc<AtomicBool>,
         avc420_enabled: Arc<AtomicBool>,
     ) -> Result<Self> {
@@ -497,7 +511,6 @@ impl MacDisplayUpdates {
             fps_interval,
             missed_frames: 0,
             target_fps,
-            mode_switcher,
             force_keyframe,
             avc420_enabled,
         })
@@ -506,16 +519,9 @@ impl MacDisplayUpdates {
 
 impl Drop for MacDisplayUpdates {
     fn drop(&mut self) {
-        // Restore the original display mode. The DisplayModeSwitcher spawns
-        // a child process to do the actual mode change (avoids SCKit/CoreGraphics
-        // crashes). This ensures the Mac's resolution returns to normal when
-        // the RDP client disconnects.
-        if let Some(ref mut switcher) = self.mode_switcher {
-            info!("Display stream ended, restoring original display mode");
-            if let Err(e) = switcher.restore() {
-                warn!("Failed to restore display mode on stream end: {e}");
-            }
-        }
+        // Do NOT restore the display mode here: this Drop also fires on
+        // deactivation-reactivation, which recreates the stream mid-connection.
+        // Restore is handled by MacDisplay::client_disconnected().
         if let CaptureSource::Sckit(stream) = &self.capture {
             if let Err(e) = stream.stop_capture() {
                 debug!("stop_capture: {e}");
@@ -1000,5 +1006,33 @@ async fn create_stream_inner(
         width, height, sck_format, target_fps, buffer_capacity
     );
     Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the reconnect half of the "display does not adapt"
+    /// bug: current_size persisted across connections, so on reconnect the
+    /// server saw client_size == display_size and never called
+    /// request_layout — no mode switch was attempted and the client got a
+    /// letterboxed native desktop.
+    ///
+    /// The other half (MacDisplayUpdates::drop restoring the display mode on
+    /// every deactivation-reactivation) has no test seam: DisplayModeSwitcher
+    /// is concrete and switches the physical display via a child process.
+    #[test]
+    fn client_disconnected_clears_per_connection_state() {
+        let mut display = MacDisplay::new();
+        display.current_size = Some(DesktopSize { width: 1920, height: 1080 });
+        display.native_size = Some(DesktopSize { width: 2560, height: 1600 });
+        display.mode_switch_pending = Some(DesktopSize { width: 1920, height: 1080 });
+
+        display.client_disconnected();
+
+        assert_eq!(display.current_size, None);
+        assert_eq!(display.native_size, None);
+        assert_eq!(display.mode_switch_pending, None);
+    }
 }
 

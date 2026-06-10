@@ -14,7 +14,7 @@ No clippy, rustfmt, or other linters are configured. CI runs `cargo build --rele
 
 **Always restore original display resolution.** Three layers enforce this — never remove any:
 
-1. `DisplayModeSwitcher::restore()` on Drop (clean exit)
+1. `DisplayModeSwitcher::restore()` — called from `MacDisplay::client_disconnected()` when a connection ends (NOT on deactivation-reactivation, which would undo a fresh mode switch), and from the switcher's own Drop on clean exit
 2. `/tmp/osxrdp_pending_restore` file (crash recovery, read on next startup)
 3. `CGConfigureOption::ConfigureForSession` (session-scoped, reverts on logout)
 

@@ -481,6 +481,7 @@ impl RdpServer {
                     if let Err(error) = self.run_connection(stream).await {
                         error!(?error, "Connection error");
                     }
+                    self.display.lock().await.client_disconnected();
                     self.static_channels = StaticChannelSet::new();
                 }
                 else => break,
